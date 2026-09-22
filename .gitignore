@@ -1,5 +1,25 @@
-build/
-.cache/
-compile_commands.json
+# CMake build trees (build/, build-asan/, build-release/, ...)
+build*/
+cmake-build-*/
+CMakeUserPresets.json
+
+# Compiler and tooling output
 *.o
+*.a
+*.so
+a.out
+compile_commands.json
+.cache/
+
+# Crash and profiling output: debug asserts abort, and the matching
+# path is meant to be profiled
+/core
+core.*
+vgcore.*
+perf.data
+perf.data.old
+callgrind.out.*
+
+# Editor and OS noise
+*.swp
 .DS_Store

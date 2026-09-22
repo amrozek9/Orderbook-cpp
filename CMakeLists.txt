@@ -17,6 +17,7 @@ FetchContent_MakeAvailable(Catch2)
 
 enable_testing()
 add_executable(tests tests/test_order_book.cpp)
+target_compile_options(tests PRIVATE -Wall -Wextra -Wpedantic)
 target_link_libraries(tests PRIVATE lob Catch2::Catch2WithMain)
 include(Catch)
 catch_discover_tests(tests)
