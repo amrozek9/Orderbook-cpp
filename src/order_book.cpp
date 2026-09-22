@@ -1,8 +1,45 @@
 #include "lob/order_book.hpp"
 
 #include <algorithm>
+#include <cassert>
 
 namespace lob {
+
+namespace {
+    std::size_t round_up_pow2(std::size_t n) {
+        std::size_t p = 1;
+        while (p < n) p <<= 1;
+        return p;
+    }
+}
+
+//--- TradeRing ---------------------------------------------------------------
+
+TradeRing::TradeRing(std::size_t capacity)
+    : buffer(round_up_pow2(capacity == 0 ? 1 : capacity)),
+      mask(buffer.size() - 1) {}
+
+bool TradeRing::push(const Trade& t) {
+    if (full()) {           //Undersized ring: count it rather than lose it quietly.
+        ++drop_count;       //Callers drain between orders and watch dropped().
+        return false;
+    }
+    buffer[head & mask] = t;
+    ++head;
+    return true;
+}
+
+bool TradeRing::pop(Trade& out) {
+    if (empty()) return false;
+    out = buffer[tail & mask];
+    ++tail;
+    return true;
+}
+
+//--- OrderBook ---------------------------------------------------------------
+
+OrderBook::OrderBook(Config cfg)
+    : trade_out(cfg.trade_capacity), policy(cfg.self_trade) {}
 
 //Walk the opposite book best-price-first, filling `incoming` until it is
 //exhausted or the next level no longer crosses the limit.
@@ -22,14 +59,37 @@ void OrderBook::match(BookSide& opposite, Order& incoming,
         PriceLevel& level = level_it->second;
         while (incoming.qty > 0 && !level.orders.empty()) {
             Order& resting = level.orders.front();      //Oldest wins
+
+            const bool self_trade = policy != SelfTradePolicy::Allow &&
+                                    incoming.owner != kAnonymous &&
+                                    incoming.owner == resting.owner;
+            if (self_trade) {
+                if (policy == SelfTradePolicy::CancelIncoming) {
+                    rep.stp_halted = true;      //Taker stops dead; book untouched
+                    incoming.qty = 0;
+                    break;
+                }
+                //CancelResting: drop the maker, no trade, keep walking.
+                rep.stp_cancelled += resting.qty;
+                level.total_qty -= resting.qty;
+                order_index.erase(resting.id);
+                level.orders.pop_front();
+                continue;
+            }
+
             const Quantity traded = std::min(incoming.qty, resting.qty);
 
             incoming.qty -= traded;
             resting.qty -= traded;
             level.total_qty -= traded;
 
-            rep.trades.push_back(Trade{resting.id, incoming.id, level_it->first, traded});
+            const Trade t{next_seq, resting.id, incoming.id,
+                          level_it->first, traded, incoming.side};
+            if (rep.trade_count == 0) rep.first_seq = next_seq;
+            ++next_seq;
+            ++rep.trade_count;
             rep.filled += traded;
+            trade_out.push(t);          //Ring, never I/O
 
             if (resting.qty == 0) {                     //Fully consumed
                 order_index.erase(resting.id);
@@ -38,6 +98,7 @@ void OrderBook::match(BookSide& opposite, Order& incoming,
         }
 
         if (level.orders.empty()) opposite.erase(level_it);
+        if (rep.stp_halted) break;
     }
 }
 
@@ -60,7 +121,7 @@ void OrderBook::remove(BookSide& book, const Locator& loc) {
     if (level.orders.empty()) book.erase(level_it);
 }
 
-ExecReport OrderBook::submit(OrderId id, Side side,
+ExecReport OrderBook::submit(OrderId id, ParticipantId owner, Side side,
                              std::optional<Price> limit, Quantity qty, bool rest_leftover) {
     ExecReport rep;
     if (order_index.count(id)) {        //Ids must be unique while live
@@ -69,27 +130,39 @@ ExecReport OrderBook::submit(OrderId id, Side side,
         return rep;
     }
 
-    Order incoming{id, limit.value_or(0), qty, side};
+    Order incoming{id, owner, limit.value_or(0), qty, side};
 
     if (side == Side::Buy) match(asks, incoming, limit, rep);
     else                   match(bids, incoming, limit, rep);
 
     rep.remaining = incoming.qty;
-    if (rest_leftover && incoming.qty > 0) {
+    //A taker halted by STP drops its remainder instead of resting into the
+    //queue it just refused to trade with.
+    if (rest_leftover && incoming.qty > 0 && !rep.stp_halted) {
         if (side == Side::Buy) insert(bids, incoming);
         else                   insert(asks, incoming);
         rep.rested = true;
     }
+    check_invariants();
     return rep;
 }
 
+ExecReport OrderBook::add_limit(OrderId id, ParticipantId owner, Side side,
+                                Price price, Quantity qty) {
+    return submit(id, owner, side, price, qty, /*rest_leftover=*/true);
+}
+
 ExecReport OrderBook::add_limit(OrderId id, Side side, Price price, Quantity qty) {
-    return submit(id, side, price, qty, /*rest_leftover=*/true);
+    return submit(id, kAnonymous, side, price, qty, /*rest_leftover=*/true);
+}
+
+ExecReport OrderBook::add_market(OrderId id, ParticipantId owner, Side side, Quantity qty) {
+    //No limit, and nothing rests: leftover is dropped when the book runs out.
+    return submit(id, owner, side, std::nullopt, qty, /*rest_leftover=*/false);
 }
 
 ExecReport OrderBook::add_market(OrderId id, Side side, Quantity qty) {
-    //No limit, and nothing rests: leftover is dropped when the book runs out.
-    return submit(id, side, std::nullopt, qty, /*rest_leftover=*/false);
+    return submit(id, kAnonymous, side, std::nullopt, qty, /*rest_leftover=*/false);
 }
 
 bool OrderBook::cancel(OrderId id) {
@@ -100,6 +173,7 @@ bool OrderBook::cancel(OrderId id) {
     order_index.erase(it);
     if (loc.side == Side::Buy) remove(bids, loc);
     else                       remove(asks, loc);
+    check_invariants();
     return true;
 }
 
@@ -113,11 +187,14 @@ ExecReport OrderBook::modify(OrderId id, Price new_price, Quantity new_qty) {
     }
 
     const Side side = it->second.side;
+    const ParticipantId owner = it->second.order_iter->owner;
     cancel(id);
     if (new_qty == 0) return rep;       //Modify to zero is just a cancel
 
-    return add_limit(id, side, new_price, new_qty);
+    return add_limit(id, owner, side, new_price, new_qty);
 }
+
+//--- queries -----------------------------------------------------------------
 
 std::optional<Price> OrderBook::best_bid() const {
     if (bids.empty()) return std::nullopt;
@@ -152,5 +229,46 @@ const Order* OrderBook::find(OrderId id) const {
     if (it == order_index.end()) return nullptr;
     return &*it->second.order_iter;
 }
+
+//--- invariants --------------------------------------------------------------
+
+#ifndef NDEBUG
+template <typename BookSide>
+void OrderBook::check_side(const BookSide& book, Side side, std::size_t& counted) const {
+    for (const auto& [price, level] : book) {
+        assert(!level.orders.empty() && "empty price level should have been erased");
+
+        Quantity sum = 0;
+        for (const Order& o : level.orders) {
+            assert(o.price == price && "order filed under the wrong price");
+            assert(o.side == side && "order filed on the wrong side");
+            assert(o.qty > 0 && "fully filled order still resting");
+            sum += o.qty;
+
+            //The index points at this exact order.
+            auto it = order_index.find(o.id);
+            assert(it != order_index.end() && "resting order missing from the index");
+            assert(it->second.price == price);
+            assert(it->second.side == side);
+            assert(&*it->second.order_iter == &o && "index iterator points elsewhere");
+        }
+        assert(sum == level.total_qty && "level total != sum of its orders");
+        counted += level.orders.size();
+    }
+}
+
+void OrderBook::check_invariants() const {
+    std::size_t counted = 0;
+    check_side(bids, Side::Buy, counted);
+    check_side(asks, Side::Sell, counted);
+    assert(counted == order_index.size() && "index size != number of resting orders");
+
+    if (!bids.empty() && !asks.empty()) {
+        assert(bids.begin()->first < asks.begin()->first && "book is crossed");
+    }
+}
+#else
+void OrderBook::check_invariants() const {}
+#endif
 
 }

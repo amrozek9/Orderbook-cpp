@@ -1,14 +1,37 @@
 #include <catch2/catch_test_macros.hpp>
 #include "lob/order_book.hpp"
 
+#include <vector>
+
+using lob::Config;
 using lob::OrderBook;
+using lob::SelfTradePolicy;
 using lob::Side;
+using lob::Trade;
+
+namespace {
+
+//Trades leave through the ring; tests pull them out here.
+std::vector<Trade> drain(OrderBook& book) {
+    std::vector<Trade> out;
+    book.drain_trades([&](const Trade& t) {out.push_back(t);});
+    return out;
+}
+
+bool identical(const Trade& a, const Trade& b) {
+    return a.seq == b.seq && a.maker_id == b.maker_id && a.taker_id == b.taker_id &&
+           a.price == b.price && a.qty == b.qty && a.taker_side == b.taker_side;
+}
+
+}
 
 TEST_CASE("New book is empty") {
     OrderBook book;
     REQUIRE(book.empty());
     REQUIRE_FALSE(book.best_bid().has_value());
     REQUIRE_FALSE(book.best_ask().has_value());
+    REQUIRE(book.trades().empty());
+    book.check_invariants();
 }
 
 //1. Rest without matching, then query top of book.
@@ -16,10 +39,12 @@ TEST_CASE("Resting order that never matches") {
     OrderBook book;
 
     auto rep = book.add_limit(1, Side::Buy, 100, 10);
-    REQUIRE(rep.trades.empty());
+    REQUIRE(rep.trade_count == 0);
+    REQUIRE(rep.first_seq == 0);
     REQUIRE(rep.filled == 0);
     REQUIRE(rep.remaining == 10);
     REQUIRE(rep.rested);
+    REQUIRE(book.trades().empty());
 
     REQUIRE(book.best_bid() == 100);
     REQUIRE_FALSE(book.best_ask().has_value());
@@ -28,12 +53,13 @@ TEST_CASE("Resting order that never matches") {
 
     //An ask above the bid does not cross either.
     auto ask = book.add_limit(2, Side::Sell, 101, 5);
-    REQUIRE(ask.trades.empty());
+    REQUIRE(ask.trade_count == 0);
     REQUIRE(ask.rested);
 
     REQUIRE(book.best_bid() == 100);
     REQUIRE(book.best_ask() == 101);
     REQUIRE(book.qty_at(Side::Sell, 101) == 5);
+    book.check_invariants();
 }
 
 //2. Cancel by id.
@@ -60,6 +86,7 @@ TEST_CASE("Cancel by id") {
     REQUIRE(book.cancel(3));
     REQUIRE(book.empty());
     REQUIRE_FALSE(book.best_bid().has_value());
+    book.check_invariants();
 }
 
 //3. One incoming against one resting, exact quantity.
@@ -68,14 +95,19 @@ TEST_CASE("Exact-quantity match clears both orders") {
     book.add_limit(1, Side::Sell, 100, 10);
 
     auto rep = book.add_limit(2, Side::Buy, 100, 10);
-    REQUIRE(rep.trades.size() == 1);
-    REQUIRE(rep.trades[0].maker_id == 1);
-    REQUIRE(rep.trades[0].taker_id == 2);
-    REQUIRE(rep.trades[0].price == 100);
-    REQUIRE(rep.trades[0].qty == 10);
+    REQUIRE(rep.trade_count == 1);
     REQUIRE(rep.filled == 10);
     REQUIRE(rep.remaining == 0);
     REQUIRE_FALSE(rep.rested);
+
+    auto fills = drain(book);
+    REQUIRE(fills.size() == 1);
+    REQUIRE(fills[0].seq == rep.first_seq);
+    REQUIRE(fills[0].maker_id == 1);
+    REQUIRE(fills[0].taker_id == 2);
+    REQUIRE(fills[0].price == 100);
+    REQUIRE(fills[0].qty == 10);
+    REQUIRE(fills[0].taker_side == Side::Buy);
 
     REQUIRE(book.empty());
 }
@@ -86,8 +118,8 @@ TEST_CASE("Aggressive price trades at the resting order's price") {
 
     //Buyer is willing to pay 105 but the maker's 100 is the print.
     auto rep = book.add_limit(2, Side::Buy, 105, 10);
-    REQUIRE(rep.trades.size() == 1);
-    REQUIRE(rep.trades[0].price == 100);
+    REQUIRE(rep.trade_count == 1);
+    REQUIRE(drain(book)[0].price == 100);
     REQUIRE(book.empty());
 }
 
@@ -105,6 +137,7 @@ TEST_CASE("Incoming order is partially filled and rests") {
     REQUIRE(book.best_bid() == 100);
     REQUIRE(book.qty_at(Side::Buy, 100) == 6);
     REQUIRE(book.find(2)->qty == 6);
+    book.check_invariants();
 }
 
 TEST_CASE("Resting order is partially filled and stays") {
@@ -120,6 +153,7 @@ TEST_CASE("Resting order is partially filled and stays") {
     REQUIRE(book.qty_at(Side::Sell, 100) == 6);
     REQUIRE(book.find(1)->qty == 6);
     REQUIRE(book.size() == 1);
+    book.check_invariants();
 }
 
 //5. Walk a queue at one price, then walk several price levels.
@@ -132,11 +166,15 @@ TEST_CASE("Walks a price level in time priority") {
 
     auto rep = book.add_limit(4, Side::Buy, 100, 12);
     REQUIRE(rep.filled == 12);
-    REQUIRE(rep.trades.size() == 3);
-    REQUIRE(rep.trades[0].maker_id == 1);       //Oldest first
-    REQUIRE(rep.trades[1].maker_id == 2);
-    REQUIRE(rep.trades[2].maker_id == 3);
-    REQUIRE(rep.trades[2].qty == 2);            //Partial on the last maker
+    REQUIRE(rep.trade_count == 3);
+
+    auto fills = drain(book);
+    REQUIRE(fills[0].maker_id == 1);        //Oldest first
+    REQUIRE(fills[1].maker_id == 2);
+    REQUIRE(fills[2].maker_id == 3);
+    REQUIRE(fills[2].qty == 2);             //Partial on the last maker
+    REQUIRE(fills[0].seq + 1 == fills[1].seq);      //Seq is contiguous per order
+    REQUIRE(fills[1].seq + 1 == fills[2].seq);
 
     REQUIRE(book.qty_at(Side::Sell, 100) == 3);
     REQUIRE(book.order_count_at(Side::Sell, 100) == 1);
@@ -152,11 +190,13 @@ TEST_CASE("Sweeps multiple price levels in price order") {
     auto rep = book.add_limit(4, Side::Buy, 102, 13);
     REQUIRE(rep.filled == 13);
     REQUIRE(rep.remaining == 0);
-    REQUIRE(rep.trades.size() == 3);
-    REQUIRE(rep.trades[0].price == 100);        //Cheapest first
-    REQUIRE(rep.trades[1].price == 101);
-    REQUIRE(rep.trades[2].price == 102);
-    REQUIRE(rep.trades[2].qty == 3);
+    REQUIRE(rep.trade_count == 3);
+
+    auto fills = drain(book);
+    REQUIRE(fills[0].price == 100);         //Cheapest first
+    REQUIRE(fills[1].price == 101);
+    REQUIRE(fills[2].price == 102);
+    REQUIRE(fills[2].qty == 3);
 
     REQUIRE(book.best_ask() == 102);
     REQUIRE(book.qty_at(Side::Sell, 102) == 2);
@@ -175,6 +215,7 @@ TEST_CASE("Stops at the limit price and rests the rest") {
     REQUIRE(book.best_bid() == 101);
     REQUIRE(book.qty_at(Side::Buy, 101) == 3);
     REQUIRE(book.best_ask() == 103);
+    book.check_invariants();
 }
 
 TEST_CASE("Selling sweeps bids from the highest price down") {
@@ -184,10 +225,13 @@ TEST_CASE("Selling sweeps bids from the highest price down") {
     book.add_limit(3, Side::Buy, 100, 5);
 
     auto rep = book.add_limit(4, Side::Sell, 100, 8);
-    REQUIRE(rep.trades.size() == 2);
-    REQUIRE(rep.trades[0].price == 101);        //Best bid first
-    REQUIRE(rep.trades[1].price == 100);
+    REQUIRE(rep.trade_count == 2);
     REQUIRE(rep.filled == 8);
+
+    auto fills = drain(book);
+    REQUIRE(fills[0].price == 101);         //Best bid first
+    REQUIRE(fills[1].price == 100);
+    REQUIRE(fills[0].taker_side == Side::Sell);
 
     REQUIRE(book.best_bid() == 100);
     REQUIRE(book.qty_at(Side::Buy, 100) == 2);
@@ -205,8 +249,10 @@ TEST_CASE("Market order ignores price and never rests") {
     REQUIRE(rep.filled == 8);
     REQUIRE(rep.remaining == 0);
     REQUIRE_FALSE(rep.rested);
-    REQUIRE(rep.trades[0].price == 100);
-    REQUIRE(rep.trades[1].price == 250);        //Pays up without a limit
+
+    auto fills = drain(book);
+    REQUIRE(fills[0].price == 100);
+    REQUIRE(fills[1].price == 250);         //Pays up without a limit
 
     REQUIRE(book.qty_at(Side::Sell, 250) == 2);
 }
@@ -224,15 +270,17 @@ TEST_CASE("Market order that exhausts the book drops the remainder") {
     REQUIRE(book.empty());
     REQUIRE_FALSE(book.best_ask().has_value());
     REQUIRE(book.find(3) == nullptr);
+    book.check_invariants();
 }
 
 TEST_CASE("Market order against an empty book does nothing") {
     OrderBook book;
     auto rep = book.add_market(1, Side::Buy, 10);
-    REQUIRE(rep.trades.empty());
+    REQUIRE(rep.trade_count == 0);
     REQUIRE(rep.filled == 0);
     REQUIRE(rep.remaining == 10);
     REQUIRE(book.empty());
+    REQUIRE(book.trades().empty());
 
     //A one-sided book is still empty for the taker's purposes.
     book.add_limit(2, Side::Buy, 100, 5);
@@ -249,7 +297,7 @@ TEST_CASE("Modify moves price and quantity, keeping the id") {
 
     auto rep = book.modify(1, 99, 4);
     REQUIRE(rep.accepted);
-    REQUIRE(rep.trades.empty());
+    REQUIRE(rep.trade_count == 0);
     REQUIRE(rep.rested);
 
     REQUIRE(book.qty_at(Side::Buy, 100) == 0);
@@ -257,6 +305,7 @@ TEST_CASE("Modify moves price and quantity, keeping the id") {
     REQUIRE(book.qty_at(Side::Buy, 99) == 4);
     REQUIRE(book.find(1)->qty == 4);
     REQUIRE(book.size() == 1);
+    book.check_invariants();
 }
 
 TEST_CASE("Modify loses time priority") {
@@ -267,9 +316,11 @@ TEST_CASE("Modify loses time priority") {
     book.modify(1, 100, 5);     //Same price, but goes to the back of the queue
 
     auto rep = book.add_limit(3, Side::Buy, 100, 10);
-    REQUIRE(rep.trades.size() == 2);
-    REQUIRE(rep.trades[0].maker_id == 2);
-    REQUIRE(rep.trades[1].maker_id == 1);
+    REQUIRE(rep.trade_count == 2);
+
+    auto fills = drain(book);
+    REQUIRE(fills[0].maker_id == 2);
+    REQUIRE(fills[1].maker_id == 1);
 }
 
 TEST_CASE("Modify into a crossing price trades immediately") {
@@ -278,13 +329,26 @@ TEST_CASE("Modify into a crossing price trades immediately") {
     book.add_limit(2, Side::Buy, 100, 5);
 
     auto rep = book.modify(2, 101, 5);      //Bid up through the ask
-    REQUIRE(rep.trades.size() == 1);
-    REQUIRE(rep.trades[0].maker_id == 1);
-    REQUIRE(rep.trades[0].taker_id == 2);
-    REQUIRE(rep.trades[0].price == 101);
+    REQUIRE(rep.trade_count == 1);
     REQUIRE(rep.filled == 5);
     REQUIRE_FALSE(rep.rested);
+
+    auto fills = drain(book);
+    REQUIRE(fills[0].maker_id == 1);
+    REQUIRE(fills[0].taker_id == 2);
+    REQUIRE(fills[0].price == 101);
     REQUIRE(book.empty());
+}
+
+TEST_CASE("Modify preserves the owner for self-trade purposes") {
+    OrderBook book;
+    book.add_limit(1, /*owner=*/7, Side::Sell, 101, 5);
+    book.add_limit(2, /*owner=*/7, Side::Buy, 100, 5);
+
+    auto rep = book.modify(2, 101, 5);      //Would be a wash trade
+    REQUIRE(rep.trade_count == 0);
+    REQUIRE(rep.stp_cancelled == 5);
+    REQUIRE(book.find(1) == nullptr);       //Resting side was cancelled
 }
 
 TEST_CASE("Modify to zero quantity is a cancel, and unknown ids are rejected") {
@@ -311,4 +375,212 @@ TEST_CASE("Duplicate live ids are rejected") {
     REQUIRE(book.size() == 1);
     REQUIRE(book.qty_at(Side::Buy, 100) == 10);
     REQUIRE(book.qty_at(Side::Buy, 99) == 0);
+    book.check_invariants();
+}
+
+//--- trade output path -------------------------------------------------------
+
+TEST_CASE("Trades go to the ring, in order, and survive until drained") {
+    OrderBook book;
+    book.add_limit(1, Side::Sell, 100, 5);
+    book.add_limit(2, Side::Sell, 101, 5);
+
+    book.add_limit(3, Side::Buy, 101, 4);       //Fill 1
+    book.add_limit(4, Side::Buy, 101, 6);       //Fills 2 and 3
+    REQUIRE(book.trades().size() == 3);         //Nothing drained yet
+
+    auto fills = drain(book);
+    REQUIRE(fills.size() == 3);
+    REQUIRE(fills[0].seq == 1);                 //Stream-wide monotonic counter
+    REQUIRE(fills[1].seq == 2);
+    REQUIRE(fills[2].seq == 3);
+    REQUIRE(fills[0].taker_id == 3);
+    REQUIRE(fills[1].taker_id == 4);
+    REQUIRE(fills[2].taker_id == 4);
+    REQUIRE(book.trades().empty());
+    REQUIRE(book.trades().dropped() == 0);
+}
+
+TEST_CASE("Ring overflow is counted, not silent") {
+    OrderBook book(Config{SelfTradePolicy::CancelResting, /*trade_capacity=*/2});
+    REQUIRE(book.trades().capacity() == 2);
+
+    book.add_limit(1, Side::Sell, 100, 1);
+    book.add_limit(2, Side::Sell, 100, 1);
+    book.add_limit(3, Side::Sell, 100, 1);
+    book.add_limit(4, Side::Sell, 100, 1);
+
+    auto rep = book.add_limit(5, Side::Buy, 100, 4);
+    REQUIRE(rep.trade_count == 4);              //The book still matched all four
+    REQUIRE(rep.filled == 4);
+    REQUIRE(book.trades().size() == 2);
+    REQUIRE(book.trades().dropped() == 2);      //Caller sized the ring too small
+    book.check_invariants();
+}
+
+TEST_CASE("Ring wraps around its capacity") {
+    lob::TradeRing ring(4);
+    Trade out{};
+    for (lob::Sequence s = 1; s <= 12; ++s) {
+        REQUIRE(ring.push(Trade{s, 1, 2, 100, 1, Side::Buy}));
+        REQUIRE(ring.pop(out));
+        REQUIRE(out.seq == s);
+    }
+    REQUIRE(ring.empty());
+    REQUIRE(ring.dropped() == 0);
+    REQUIRE_FALSE(ring.pop(out));
+}
+
+//--- determinism / replay ----------------------------------------------------
+
+TEST_CASE("The same input sequence produces the same trades, every run") {
+    const auto replay = [](OrderBook& book) {
+        book.add_limit(1, 11, Side::Sell, 102, 5);
+        book.add_limit(2, 12, Side::Sell, 100, 5);
+        book.add_limit(3, 11, Side::Sell, 101, 5);
+        book.add_limit(4, 12, Side::Buy, 99, 7);
+        book.modify(4, 103, 12);
+        book.add_market(5, 13, Side::Sell, 4);
+        book.cancel(3);
+        book.add_limit(6, 13, Side::Buy, 104, 9);
+        book.add_market(7, 11, Side::Buy, 100);     //Runs the book dry
+    };
+
+    OrderBook first, second;
+    replay(first);
+    replay(second);
+
+    const auto a = drain(first);
+    const auto b = drain(second);
+    REQUIRE_FALSE(a.empty());
+    REQUIRE(a.size() == b.size());
+    for (std::size_t i = 0; i < a.size(); ++i) REQUIRE(identical(a[i], b[i]));
+
+    //Book state matches too, not just the trade stream.
+    REQUIRE(first.size() == second.size());
+    REQUIRE(first.best_bid() == second.best_bid());
+    REQUIRE(first.best_ask() == second.best_ask());
+    first.check_invariants();
+    second.check_invariants();
+}
+
+TEST_CASE("Trade sequence numbers restart per book, not per process") {
+    OrderBook a, b;
+    a.add_limit(1, Side::Sell, 100, 1);
+    a.add_limit(2, Side::Buy, 100, 1);
+    b.add_limit(1, Side::Sell, 100, 1);
+    b.add_limit(2, Side::Buy, 100, 1);
+
+    REQUIRE(drain(a)[0].seq == 1);
+    REQUIRE(drain(b)[0].seq == 1);      //No shared global counter
+}
+
+//--- self-trade prevention ---------------------------------------------------
+
+TEST_CASE("Anonymous orders never trigger self-trade prevention") {
+    OrderBook book;     //Both sides default to kAnonymous
+    book.add_limit(1, Side::Sell, 100, 5);
+
+    auto rep = book.add_limit(2, Side::Buy, 100, 5);
+    REQUIRE(rep.trade_count == 1);
+    REQUIRE(rep.stp_cancelled == 0);
+    REQUIRE(book.empty());
+}
+
+TEST_CASE("CancelResting kills the maker and lets the taker keep walking") {
+    OrderBook book;     //Default policy
+    REQUIRE(book.self_trade_policy() == SelfTradePolicy::CancelResting);
+    book.add_limit(1, /*owner=*/7, Side::Sell, 100, 5);     //Same owner as the taker
+    book.add_limit(2, /*owner=*/8, Side::Sell, 100, 5);
+    book.add_limit(3, /*owner=*/8, Side::Sell, 101, 5);
+
+    auto rep = book.add_limit(4, /*owner=*/7, Side::Buy, 101, 12);
+    REQUIRE(rep.stp_cancelled == 5);            //Order 1 removed, no print
+    REQUIRE_FALSE(rep.stp_halted);
+    REQUIRE(rep.filled == 10);                  //Still filled by orders 2 and 3
+    REQUIRE(rep.remaining == 2);
+    REQUIRE(rep.rested);
+
+    auto fills = drain(book);
+    REQUIRE(fills.size() == 2);
+    for (const Trade& t : fills) REQUIRE(t.maker_id != 1);
+
+    REQUIRE(book.find(1) == nullptr);
+    REQUIRE(book.best_bid() == 101);            //Leftover rested
+    book.check_invariants();
+}
+
+TEST_CASE("CancelIncoming stops the taker and leaves the book untouched") {
+    OrderBook book(Config{SelfTradePolicy::CancelIncoming, 4096});
+    book.add_limit(1, /*owner=*/8, Side::Sell, 100, 5);
+    book.add_limit(2, /*owner=*/7, Side::Sell, 101, 5);     //Same owner as the taker
+
+    auto rep = book.add_limit(3, /*owner=*/7, Side::Buy, 101, 12);
+    REQUIRE(rep.filled == 5);                   //Traded with order 1 first
+    REQUIRE(rep.stp_halted);
+    REQUIRE(rep.stp_cancelled == 0);            //Nothing resting was removed
+    REQUIRE(rep.remaining == 0);                //Remainder dropped, not rested
+    REQUIRE_FALSE(rep.rested);
+
+    REQUIRE(book.find(2) != nullptr);           //Maker survives untouched
+    REQUIRE(book.qty_at(Side::Sell, 101) == 5);
+    REQUIRE_FALSE(book.best_bid().has_value());
+    book.check_invariants();
+}
+
+TEST_CASE("Allow prints the wash trade") {
+    OrderBook book(Config{SelfTradePolicy::Allow, 4096});
+    book.add_limit(1, /*owner=*/7, Side::Sell, 100, 5);
+
+    auto rep = book.add_limit(2, /*owner=*/7, Side::Buy, 100, 5);
+    REQUIRE(rep.trade_count == 1);
+    REQUIRE(rep.filled == 5);
+    REQUIRE(rep.stp_cancelled == 0);
+    REQUIRE_FALSE(rep.stp_halted);
+
+    auto fills = drain(book);
+    REQUIRE(fills[0].maker_id == 1);
+    REQUIRE(fills[0].taker_id == 2);
+    REQUIRE(book.empty());
+}
+
+TEST_CASE("Self-trade prevention only fires against the same owner") {
+    OrderBook book;
+    book.add_limit(1, /*owner=*/7, Side::Sell, 100, 5);
+
+    auto rep = book.add_limit(2, /*owner=*/9, Side::Buy, 100, 5);
+    REQUIRE(rep.trade_count == 1);
+    REQUIRE(rep.stp_cancelled == 0);
+    REQUIRE(book.empty());
+}
+
+TEST_CASE("CancelResting can empty a level and move the top of book") {
+    OrderBook book;
+    book.add_limit(1, /*owner=*/7, Side::Sell, 100, 5);
+    book.add_limit(2, /*owner=*/7, Side::Sell, 100, 5);
+    book.add_limit(3, /*owner=*/8, Side::Sell, 102, 5);
+
+    auto rep = book.add_limit(4, /*owner=*/7, Side::Buy, 101, 5);
+    REQUIRE(rep.stp_cancelled == 10);       //Whole level wiped
+    REQUIRE(rep.filled == 0);
+    REQUIRE(rep.rested);                    //Rests at 101, below the 102 ask
+
+    REQUIRE(book.qty_at(Side::Sell, 100) == 0);
+    REQUIRE(book.best_ask() == 102);
+    REQUIRE(book.best_bid() == 101);
+    REQUIRE(book.trades().empty());         //STP cancels do not print
+    book.check_invariants();
+}
+
+TEST_CASE("Self-trade prevention against a market order that runs the book dry") {
+    OrderBook book;
+    book.add_limit(1, /*owner=*/7, Side::Sell, 100, 5);
+    book.add_limit(2, /*owner=*/7, Side::Sell, 101, 5);
+
+    auto rep = book.add_market(3, /*owner=*/7, Side::Buy, 10);
+    REQUIRE(rep.filled == 0);
+    REQUIRE(rep.stp_cancelled == 10);
+    REQUIRE(rep.remaining == 10);
+    REQUIRE(book.empty());
+    book.check_invariants();
 }
