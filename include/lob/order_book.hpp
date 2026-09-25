@@ -21,6 +21,11 @@
 // caller drains. Nothing in the matching path allocates, formats, or performs
 // I/O -- printing a fill inside the hot loop would make every measurement of it
 // meaningless.
+//
+// Threading: an OrderBook is not thread-safe. Distinct books share no state and
+// may run concurrently on separate threads; a single book may move between
+// threads only with caller-supplied synchronization. tests/test_threading.cpp
+// checks both under ThreadSanitizer.
 //-----------------------------------------------------------------------------
 
 namespace lob {

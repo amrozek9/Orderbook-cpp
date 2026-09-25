@@ -166,19 +166,42 @@ non-zero on the first divergence.
 
 ### Sanitizers
 
-The full suite and the fuzzer are run under AddressSanitizer and
-UndefinedBehaviorSanitizer, and both are clean. This matters here because the
-engine hands out `std::list` iterators as locators and erases list nodes during
-matching -- exactly the shape of code that produces use-after-free, and the same
-shape the intrusive lists and object pools of a later phase will have.
+Sanitized builds each get their own tree, selected with `LOB_SANITIZER`, since
+AddressSanitizer and ThreadSanitizer cannot be linked into the same binary. The
+option is applied before Catch2 is fetched, so the test framework is
+instrumented too.
+
+**AddressSanitizer + UndefinedBehaviorSanitizer.** The full suite and the fuzzer
+run clean. This matters here because the engine hands out `std::list` iterators
+as locators and erases list nodes during matching -- exactly the shape of code
+that produces use-after-free, and the same shape the intrusive lists and object
+pools of a later phase will have.
 
 ```sh
-cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug \
-  -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=all"
+cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug -DLOB_SANITIZER=address
 cmake --build build-asan -j
 ./build-asan/tests
 ./build-asan/difftest 20000
 ```
+
+**ThreadSanitizer.** An `OrderBook` is not thread-safe. What it does promise is
+that distinct books share no state, so they can run concurrently, and that one
+book can move between threads given caller-supplied synchronization.
+`tests/test_threading.cpp` checks both against a single-threaded run, and under
+TSan any hidden shared state -- a static cache, a global counter -- becomes a
+reported race instead of an occasional wrong answer. The build runs clean, and
+it is not vacuous: removing the lock from the hand-off pattern makes TSan report
+a data race in `OrderBook::submit`.
+
+```sh
+cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=Debug -DLOB_SANITIZER=thread
+cmake --build build-tsan -j
+./build-tsan/tests
+```
+
+TSan only sees code that actually runs concurrently. When the engine grows real
+concurrency -- a feed handler thread, a lock-free queue in front of the book --
+its tests belong in `test_threading.cpp` so this build keeps meaning something.
 
 ## Build
 
