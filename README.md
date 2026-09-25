@@ -203,6 +203,163 @@ TSan only sees code that actually runs concurrently. When the engine grows real
 concurrency -- a feed handler thread, a lock-free queue in front of the book --
 its tests belong in `test_threading.cpp` so this build keeps meaning something.
 
+## Benchmarking
+
+`bench` times every operation on its own and reports the distribution, never
+the mean. A mean of 80 ns with a p99.9 of 40 µs describes a worse engine than a
+mean of 120 ns with a p99.9 of 300 ns, and an average cannot tell them apart.
+
+```sh
+cmake -S . -B build-rel -DCMAKE_BUILD_TYPE=Release
+cmake --build build-rel -j
+./build-rel/bench                          # 5 runs x 2M timed ops
+./build-rel/bench --runs 10 --ops 10000000 --depth 20000 --dump build-rel/samples.csv
+```
+
+Options: `--ops`, `--warmup`, `--runs`, `--seed`, `--depth`, `--cpu` or
+`--no-pin`, `--prefault`, and `--dump`, which writes every timed sample as
+`run,index,kind,ns`. It refuses to run in a debug or sanitized build, where
+`check_invariants()` walks the whole book after every operation and would be all
+it measured.
+
+### The flow looks like a real feed
+
+A benchmark only describes the flow it runs. Uniformly random orders mostly miss
+each other, so a naive generator times a book that does little but insert, and
+tuning that makes the wrong path fast. `bench/flow.hpp` generates this instead:
+
+| Operation | Share | Shape |
+|---|---|---|
+| Add | 50% | Passive. 80% rest within a few ticks of the touch, geometrically; the rest spread up to 100 ticks deep |
+| Cancel | 40% | 80% hit one of the newest orders, each step further back less likely; the rest hit any live order |
+| Modify | 5% | Re-priced near the touch (cancel plus add) |
+| Marketable | 5% | Market orders and limits priced through the touch -- the only operations that trade |
+
+- **Prices** are offsets from a mid that random-walks one tick at a time, about
+  once every hundred operations. The spread stays at one tick at p50 and two at
+  p99, while depth builds up behind it.
+- **Depth holds steady.** Passive adds first build the book to its target depth,
+  5,000 orders by default. From then on, each marketable order is sized to take
+  about two resting orders, which balances 50% adds against 40% cancels. It
+  takes more when the book is thick and fewer when it is thin, so depth stays
+  near its target over any run length instead of drifting away: 4,432 to 5,532
+  orders over 2M operations.
+- **Every operation does what its label says.** Generation drives its own copy
+  of the engine, so:
+  - cancels and modifies always name an order resting at that moment;
+  - passive adds are priced so they never cross;
+  - marketable orders are sized against the depth that is actually there.
+
+  A cancel of an unknown id is a single hash miss; counting those would flatter
+  the cancel numbers.
+- **Flat and pre-generated.** The whole sequence -- depth build, warm-up and
+  timed operations -- goes into one flat array before timing starts, so none of
+  the generation cost is measured.
+- **Reproducible.** Generation uses integer arithmetic only, so a seed gives the
+  same flow on every platform. The report prints a flow hash, which confirms
+  that two runs timed identical input. Every run's trade stream is hashed too,
+  and checked against the generator's own run before anything is reported.
+
+`tests/test_flow.cpp` holds the generator to all of the above.
+
+### Methodology
+
+Each rule below says what could go wrong, what `bench` does about it, and how
+the output shows it worked.
+
+| Rule | What `bench` does | How it is checked |
+|---|---|---|
+| Stop the optimizer deleting work | Every result passes through `do_not_optimize()`, an empty inline-asm barrier (the trick behind `benchmark::DoNotOptimize`), inside the timed bracket | Built with `-flto`, every engine call is still inside the timed loop, and the trade streams still match |
+| Warm up | Each run replays 300,000 mixed operations (`--warmup`) through the same never-inlined timing loop before recording, so the branch predictor is trained on the exact code that is then timed | The header states the warm-up each run gets |
+| Pin to a core | `pthread_setaffinity_np` to `--cpu`, or else the last CPU allowed, since CPU 0 tends to take the most interrupts | The header names the CPU; it is re-checked after every run, and a run found elsewhere is flagged |
+| Fix the clock frequency | Reads the cpufreq governor and boost setting; warns unless the governor is `performance` and boost is off. Calibration spins for 200 ms right before the first run, so the core is at full speed | Printed in the header |
+| Pre-fault memory | Flow and sample buffers are written before timing. On glibc the heap is grown by 64 MiB (`--prefault`), every page touched, and trimming turned off, so engine allocations land on resident pages | Page faults during each timed pass are counted: 0 in every run |
+| `rdtscp`, not `std::chrono` | Each sample brackets one engine call between `lfence; rdtsc; lfence` and `rdtscp; lfence`, and is stored in ticks. Conversion to nanoseconds happens once, in the report | The header prints the TSC rate and resolution |
+| Subtract timer overhead | The median cost of an empty bracket, 96 ticks (30 ns) here, is subtracted from every sample | Printed in the header |
+| Repeat and report variance | 5 runs (`--runs`), each on a fresh book. The report gives the median of every percentile across runs, and each cell's spread | The spread table |
+
+The pre-fault is a guard for books larger than the default. At 5,000 orders the
+depth build already maps everything the timed pass touches, and faults are 0
+without it. With `--depth 200000`, the first run takes 13-15 page faults inside
+the timed pass without it, even after warm-up, and 0 with it.
+
+On the clock:
+
+- The fenced bracket costs about twice a bare back-to-back `rdtsc` here,
+  because the fences are what stop the timed call from overlapping the clock
+  reads.
+- On this Zen 3 part the TSC advances in steps of 32 ticks, so every sample is a
+  multiple of 10 ns. A 10% spread at p50 is one clock step.
+
+The `(spin)` row busy-waits for as long as the median operation, as many times,
+with no engine involved. Interrupts and hypervisor exits land in a window in
+proportion to its length, so that row is the machine's own contribution at each
+percentile.
+
+### Results
+
+Ryzen 7 7735HS under WSL2, GCC 15 `-O3`, 5 runs of 2M operations over a book of
+about 5,000 orders:
+
+```
+runs (ns over all timed ops; page faults and context switches while timing)
+  run 1  p50 100  p99 441  p99.9 1,042  p99.99 20,538  max 1,574,932   faults 0  switches 1
+  run 2  p50 100  p99 431  p99.9 1,062  p99.99 20,027  max 1,321,548   faults 0  switches 1
+  run 3  p50 100  p99 441  p99.9 1,012  p99.99 20,808  max 1,620,885   faults 0  switches 1
+  run 4  p50 100  p99 441  p99.9 1,062  p99.99 20,888  max 2,177,633   faults 0  switches 0
+  run 5  p50 100  p99 431  p99.9 982  p99.99 20,377  max 1,684,380   faults 0  switches 0
+
+latency (ns), median of 5 runs
+                    count      p50      p99    p99.9   p99.99        max
+  all           2,000,000      100      441    1,042   20,538  1,620,885
+  add             999,655      100      351      822   20,848    768,626
+  cancel          799,831       90      270      631   19,215  1,000,020
+  modify          100,354      190      461    1,082   21,249    260,201
+  marketable      100,160      160    1,032    2,164   21,860    449,044
+  (spin)        2,000,000      110      140      200   17,933    781,452
+
+spread across runs, (max - min) / median
+                                p50      p99    p99.9   p99.99        max
+  all                           0%       2%       8%       4%        53%
+  add                          10%       3%       6%       4%       187%
+  cancel                        0%       4%      27%      23%       116%
+  modify                        0%      11%      18%      25%       228%
+  marketable                    6%       5%      18%      44%       351%
+  (spin)                        0%      21%      35%       6%       284%
+```
+
+**p50 through p99.9 are the engine.** The spin row stays at 110-200 ns there,
+while the operations are several times that.
+
+**p99.99 and max are the machine.** Spinning for 110 ns with no engine involved
+still reaches 18 µs at p99.99, the same range as every operation type. A
+standalone check agrees: the count of multi-microsecond spikes grows in
+proportion to the length of the timed window, which is the signature of
+interrupts rather than of anything the code does.
+
+**What a result has to beat.** Overall p99 is stable to 2%, but per-type p99.9
+moves by up to 27% between runs. A change to the engine is real only when it
+exceeds the spread of the cell it claims to improve. For example, a 3% gain in
+cancel p99.9 is noise here.
+
+WSL2 has no cpufreq interface -- the Windows host owns the clock -- so the
+governor cannot be fixed from inside it. For tails worth quoting, use bare-metal
+Linux:
+
+- `sudo cpupower frequency-set -g performance`, with boost off;
+- an isolated core (`isolcpus`, `nohz_full`), passed as `--cpu`.
+
+What the engine rows already say:
+
+- Modify costs about twice an add, because it is a cancel plus an add.
+- Marketable orders have a p99 three times an add's, because a sweep erases
+  several orders and sometimes whole price levels.
+- Every add allocates a list node and a hash-map node, plus a map node when it
+  opens a new level. Every cancel frees them. Those allocations are the first
+  suspects for the p99 and p99.9, and the obvious target for the next round of
+  work. When that work brings object pools, they must be touched at
+  construction, for the same reason the heap is pre-faulted now.
+
 ## Build
 
 ```sh
