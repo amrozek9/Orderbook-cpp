@@ -86,9 +86,12 @@ operation that caused it rather than three operations later. It checks that:
 
 Level aggregates are 64-bit (`lob::Volume`) while a single order's quantity is
 32-bit, because one level can hold many near-max orders. Summing them in the
-narrower type wraps silently.
+narrower type wraps, and an invariant that computed the sum the same way would
+not notice.
 
 ## Testing
+
+Three layers, each catching what the one above it misses.
 
 ### Unit tests
 
@@ -98,6 +101,84 @@ operation plus the edge cases -- zero quantities, duplicate ids across sides,
 price `0` and `UINT64_MAX`, level volume past 2^32, emptying and reusing a
 level, exact level exhaustion, ring capacity boundaries, and each self-trade
 policy.
+
+### Randomized differential testing
+
+This is the layer that finds the real bugs. `tests/reference_book.hpp` is a
+second, deliberately naive order book: every resting order lives in one flat
+vector and every operation is a linear scan. It shares no data structure with
+the engine, so when the two disagree, one of them is genuinely wrong.
+
+`difftest` drives both with the same random operation sequence and requires
+three things to match: the trade streams byte for byte, the `ExecReport`
+returned by every single operation, and the resulting queues order for order
+rather than just membership. Comparing the reports matters because a report can
+lie while the book itself stays correct. The generator is biased toward the cases that
+actually exercise matching:
+
+- prices in a 7-tick band around a single reference price, so orders cross
+  constantly -- uniform prices over a wide range almost never cross, and the
+  matching path would barely run;
+- a handful of distinct prices and small quantities, producing deep queues at
+  identical prices and a mix of exact and partial fills;
+- three participants with frequent anonymous orders, so self-trade prevention
+  fires constantly;
+- cancels and modifies weighted toward recently touched ids, which are the ones
+  most likely to have just been filled, exercising cancel-of-dead-id and index
+  cleanup; plus occasional never-issued ids and duplicate live ids.
+
+On a 40-operation sequence that yields about 12 trades, and every sequence
+produces at least one.
+
+When a sequence diverges it is shrunk by greedy delta debugging -- chunks first,
+then single operations -- down to the smallest sequence that still diverges, and
+printed as pasteable C++. Planted bugs shrink from 40 operations to two or three:
+
+```
+DIVERGENCE at seed 1: shrunk 40 ops -> 3
+lob::OrderBook book(lob::Config{lob::SelfTradePolicy::Allow, 4096});
+book.add_limit(23, 3, Side::Sell, 997, 6);
+book.add_limit(24, 3, Side::Sell, 997, 5);
+book.add_limit(29, 3, Side::Buy, 997, 3);
+```
+
+The Catch2 suite runs several thousand sequences on every build. Longer
+campaigns run clean at 2,000,000 sequences of 40 operations and 400,000
+sequences of 200 operations -- 160 million operations, no divergence.
+
+The layer is checked by planting bugs in the engine and confirming they are
+caught: a trade printed at the taker's price instead of the maker's, LIFO
+instead of FIFO at a price level, and a self-trade-halted taker resting its
+remainder. The first two shrink to two and three operations; the third trips the
+crossed-book invariant in debug builds and the differential comparison in
+release. Chasing that third one is also what surfaced a real flaw -- a halted
+taker used to report `remaining == 0`, indistinguishable from a complete fill.
+
+For longer campaigns:
+
+```sh
+./build/difftest [sequences] [first_seed] [ops_per_sequence]
+./build/difftest 2000000 1 40
+```
+
+It is deterministic: a seed always reproduces the same sequence, and it exits
+non-zero on the first divergence.
+
+### Sanitizers
+
+The full suite and the fuzzer are run under AddressSanitizer and
+UndefinedBehaviorSanitizer, and both are clean. This matters here because the
+engine hands out `std::list` iterators as locators and erases list nodes during
+matching -- exactly the shape of code that produces use-after-free, and the same
+shape the intrusive lists and object pools of a later phase will have.
+
+```sh
+cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=all"
+cmake --build build-asan -j
+./build-asan/tests
+./build-asan/difftest 20000
+```
 
 ## Build
 

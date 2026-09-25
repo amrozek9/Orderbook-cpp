@@ -519,8 +519,8 @@ TEST_CASE("CancelIncoming stops the taker and leaves the book untouched") {
     REQUIRE(rep.filled == 5);                   //Traded with order 1 first
     REQUIRE(rep.stp_halted);
     REQUIRE(rep.stp_cancelled == 0);            //Nothing resting was removed
-    REQUIRE(rep.remaining == 0);                //Remainder dropped, not rested
-    REQUIRE_FALSE(rep.rested);
+    REQUIRE(rep.remaining == 7);                //Cancelled, and reported as such
+    REQUIRE_FALSE(rep.rested);                  //remaining>0 + !rested == dropped
 
     REQUIRE(book.find(2) != nullptr);           //Maker survives untouched
     REQUIRE(book.qty_at(Side::Sell, 101) == 5);
@@ -700,6 +700,21 @@ TEST_CASE("The ring holds exactly its capacity before dropping") {
     book.add_limit(12, Side::Buy, 100, 1);      //One trade too many
     REQUIRE(book.trades().dropped() == 1);
     REQUIRE(book.trades().size() == 4);
+}
+
+TEST_CASE("Visiting resting orders yields book order") {
+    OrderBook book;
+    book.add_limit(1, Side::Buy, 99, 1);
+    book.add_limit(2, Side::Buy, 101, 1);       //Better bid
+    book.add_limit(3, Side::Buy, 101, 1);       //Same price, later
+    book.add_limit(4, Side::Sell, 105, 1);
+    book.add_limit(5, Side::Sell, 103, 1);      //Better ask
+
+    std::vector<lob::OrderId> seen;
+    book.for_each_resting([&](const lob::Order& o) {seen.push_back(o.id);});
+
+    //Bids best-first with time priority inside the level, then asks best-first.
+    REQUIRE(seen == std::vector<lob::OrderId>{2, 3, 1, 5, 4});
 }
 
 TEST_CASE("Modify can lift an order through the whole opposite side") {

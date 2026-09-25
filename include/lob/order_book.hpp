@@ -165,6 +165,17 @@ namespace lob {
         bool empty() const {return order_index.empty();}
         SelfTradePolicy self_trade_policy() const {return policy;}
 
+        //Visit every resting order in book order: bids best-first, then asks
+        //best-first, and within a price level in time priority. Useful for
+        //publishing a book snapshot, and for asserting queue order in tests.
+        template <typename F>
+        void for_each_resting(F&& fn) const {
+            for (const auto& [price, level] : bids)
+                for (const Order& o : level.orders) fn(o);
+            for (const auto& [price, level] : asks)
+                for (const Order& o : level.orders) fn(o);
+        }
+
         //Level totals equal the sum of their orders, the index size equals the
         //number of resting orders, and the book is never crossed. Asserts in
         //debug builds (and runs after every mutating call); a no-op under NDEBUG.

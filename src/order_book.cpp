@@ -65,8 +65,11 @@ void OrderBook::match(BookSide& opposite, Order& incoming,
                                     incoming.owner == resting.owner;
             if (self_trade) {
                 if (policy == SelfTradePolicy::CancelIncoming) {
-                    rep.stp_halted = true;      //Taker stops dead; book untouched
-                    incoming.qty = 0;
+                    //Taker stops dead and the book is left untouched. Keep its
+                    //unfilled quantity intact so `remaining` reports how much
+                    //was cancelled; `rested` stays false, so the caller can
+                    //tell this apart from a leftover that joined the book.
+                    rep.stp_halted = true;
                     break;
                 }
                 //CancelResting: drop the maker, no trade, keep walking.
