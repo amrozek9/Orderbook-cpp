@@ -584,3 +584,161 @@ TEST_CASE("Self-trade prevention against a market order that runs the book dry")
     REQUIRE(book.empty());
     book.check_invariants();
 }
+
+//--- edge cases --------------------------------------------------------------
+
+TEST_CASE("Zero-quantity orders are rejected, not silently swallowed") {
+    OrderBook book;
+
+    auto limit = book.add_limit(1, Side::Buy, 100, 0);
+    REQUIRE_FALSE(limit.accepted);
+    REQUIRE(limit.filled == 0);
+    REQUIRE_FALSE(limit.rested);
+
+    auto market = book.add_market(2, Side::Sell, 0);
+    REQUIRE_FALSE(market.accepted);
+
+    REQUIRE(book.empty());          //Neither left a trace
+    book.check_invariants();
+}
+
+TEST_CASE("A level holds more volume than a 32-bit quantity can express") {
+    //Two near-max orders sum past 2^32. The per-order type stays 32-bit; the
+    //level aggregate must be wider or it wraps and every total goes wrong.
+    OrderBook book;
+    book.add_limit(1, Side::Buy, 100, 3'000'000'000u);
+    book.add_limit(2, Side::Buy, 100, 3'000'000'000u);
+
+    REQUIRE(book.qty_at(Side::Buy, 100) == 6'000'000'000ull);
+    REQUIRE(book.order_count_at(Side::Buy, 100) == 2);
+    book.check_invariants();        //Would trip if the total had wrapped
+
+    REQUIRE(book.cancel(1));
+    REQUIRE(book.qty_at(Side::Buy, 100) == 3'000'000'000ull);
+}
+
+TEST_CASE("Price zero and max price are ordinary prices") {
+    OrderBook book;
+    book.add_limit(1, Side::Buy, 0, 5);
+    book.add_limit(2, Side::Sell, UINT64_MAX, 5);
+
+    REQUIRE(book.best_bid() == 0);
+    REQUIRE(book.best_ask() == UINT64_MAX);
+    REQUIRE(book.qty_at(Side::Buy, 0) == 5);
+    book.check_invariants();
+
+    //A market buy still reaches the ask at the top of the range.
+    auto rep = book.add_market(3, Side::Buy, 5);
+    REQUIRE(rep.filled == 5);
+    REQUIRE(drain(book)[0].price == UINT64_MAX);
+}
+
+TEST_CASE("A duplicate id is rejected even on the opposite side") {
+    OrderBook book;
+    book.add_limit(1, Side::Buy, 100, 10);
+
+    auto dup = book.add_limit(1, Side::Sell, 200, 5);
+    REQUIRE_FALSE(dup.accepted);
+    REQUIRE(book.size() == 1);
+    REQUIRE(book.find(1)->side == Side::Buy);       //Original untouched
+    REQUIRE_FALSE(book.best_ask().has_value());
+}
+
+TEST_CASE("Self-trade prevention needs an owner on both sides") {
+    SECTION("anonymous taker, owned maker") {
+        OrderBook book;
+        book.add_limit(1, /*owner=*/7, Side::Sell, 100, 5);
+        auto rep = book.add_limit(2, lob::kAnonymous, Side::Buy, 100, 5);
+        REQUIRE(rep.trade_count == 1);
+        REQUIRE(rep.stp_cancelled == 0);
+    }
+    SECTION("owned taker, anonymous maker") {
+        OrderBook book;
+        book.add_limit(1, lob::kAnonymous, Side::Sell, 100, 5);
+        auto rep = book.add_limit(2, /*owner=*/7, Side::Buy, 100, 5);
+        REQUIRE(rep.trade_count == 1);
+        REQUIRE(rep.stp_cancelled == 0);
+    }
+}
+
+TEST_CASE("Exhausting a level exactly continues into the next one") {
+    OrderBook book;
+    book.add_limit(1, Side::Sell, 100, 5);
+    book.add_limit(2, Side::Sell, 101, 5);
+
+    auto rep = book.add_limit(3, Side::Buy, 101, 10);
+    REQUIRE(rep.trade_count == 2);
+    REQUIRE(rep.filled == 10);
+    REQUIRE(book.empty());              //Both levels cleaned up
+    REQUIRE_FALSE(book.best_ask().has_value());
+    book.check_invariants();
+}
+
+TEST_CASE("A level can be emptied and then reused") {
+    OrderBook book;
+    book.add_limit(1, Side::Buy, 100, 5);
+    REQUIRE(book.cancel(1));
+    REQUIRE(book.qty_at(Side::Buy, 100) == 0);
+
+    book.add_limit(2, Side::Buy, 100, 7);       //Same price, fresh level
+    REQUIRE(book.best_bid() == 100);
+    REQUIRE(book.qty_at(Side::Buy, 100) == 7);
+    REQUIRE(book.order_count_at(Side::Buy, 100) == 1);
+    book.check_invariants();
+}
+
+TEST_CASE("The ring holds exactly its capacity before dropping") {
+    OrderBook book(Config{SelfTradePolicy::CancelResting, /*trade_capacity=*/4});
+    for (lob::OrderId id = 1; id <= 4; ++id) book.add_limit(id, Side::Sell, 100, 1);
+
+    auto rep = book.add_limit(10, Side::Buy, 100, 4);
+    REQUIRE(rep.trade_count == 4);
+    REQUIRE(book.trades().size() == 4);         //Exactly full
+    REQUIRE(book.trades().dropped() == 0);      //Nothing lost yet
+
+    book.add_limit(11, Side::Sell, 100, 1);
+    book.add_limit(12, Side::Buy, 100, 1);      //One trade too many
+    REQUIRE(book.trades().dropped() == 1);
+    REQUIRE(book.trades().size() == 4);
+}
+
+TEST_CASE("Modify can lift an order through the whole opposite side") {
+    OrderBook book;
+    book.add_limit(1, Side::Sell, 101, 3);
+    book.add_limit(2, Side::Sell, 102, 3);
+    book.add_limit(3, Side::Buy, 90, 10);       //Far from the market
+
+    auto rep = book.modify(3, 102, 10);         //Now crosses both ask levels
+    REQUIRE(rep.trade_count == 2);
+    REQUIRE(rep.filled == 6);
+    REQUIRE(rep.remaining == 4);
+    REQUIRE(rep.rested);
+
+    REQUIRE_FALSE(book.best_ask().has_value());
+    REQUIRE(book.best_bid() == 102);
+    REQUIRE(book.qty_at(Side::Buy, 102) == 4);
+    book.check_invariants();
+}
+
+TEST_CASE("Modify that only lowers quantity keeps the order at its price") {
+    OrderBook book;
+    book.add_limit(1, Side::Buy, 100, 10);
+
+    auto rep = book.modify(1, 100, 3);
+    REQUIRE(rep.rested);
+    REQUIRE(rep.trade_count == 0);
+    REQUIRE(book.qty_at(Side::Buy, 100) == 3);
+    REQUIRE(book.order_count_at(Side::Buy, 100) == 1);
+    REQUIRE(book.size() == 1);
+}
+
+TEST_CASE("Trade sequence numbers never repeat across many orders") {
+    OrderBook book;
+    for (lob::OrderId id = 1; id <= 20; ++id) book.add_limit(id, Side::Sell, 100, 1);
+    book.add_limit(100, Side::Buy, 100, 20);
+
+    auto fills = drain(book);
+    REQUIRE(fills.size() == 20);
+    for (std::size_t i = 0; i < fills.size(); ++i)
+        REQUIRE(fills[i].seq == static_cast<lob::Sequence>(i + 1));
+}

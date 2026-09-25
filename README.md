@@ -81,7 +81,22 @@ not defined, and compiles to nothing when it is. It checks that:
 - every resting order is filed under its own price and side;
 - `order_index.size()` equals the number of resting orders, and each index entry
   points at the exact order object it claims to;
-- best bid is strictly below best ask — the book is never crossed.
+- best bid is strictly below best ask -- the book is never crossed.
+
+Level aggregates are 64-bit (`lob::Volume`) while a single order's quantity is
+32-bit, because one level can hold many near-max orders. Summing them in the
+narrower type wraps silently.
+
+## Testing
+
+### Unit tests
+
+One behaviour per test, each written as a scenario: set up a book, send one
+order, assert on the trades and on the resulting book state. They cover every
+operation plus the edge cases -- zero quantities, duplicate ids across sides,
+price `0` and `UINT64_MAX`, level volume past 2^32, emptying and reusing a
+level, exact level exhaustion, ring capacity boundaries, and each self-trade
+policy.
 
 ## Build
 

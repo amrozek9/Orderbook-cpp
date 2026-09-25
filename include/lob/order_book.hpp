@@ -27,6 +27,9 @@ namespace lob {
     using OrderId = std::uint64_t;
     using Price = std::uint64_t;    //Ticks
     using Quantity = std::uint32_t;
+    //Aggregates (level totals, resting volume) need more room than one
+    //order's quantity: a level can hold many orders of near-max size.
+    using Volume = std::uint64_t;
     using ParticipantId = std::uint32_t;
     using Sequence = std::uint64_t;
 
@@ -52,7 +55,7 @@ namespace lob {
     };
 
     struct PriceLevel {
-        Quantity total_qty = 0;
+        Volume total_qty = 0;
         std::list<Order> orders;    //FIFO: front has time priority
     };
 
@@ -106,7 +109,7 @@ namespace lob {
         std::uint32_t trade_count = 0;
         Quantity filled = 0;                //Total matched
         Quantity remaining = 0;             //Unmatched leftover
-        Quantity stp_cancelled = 0;         //Resting qty killed by self-trade prevention
+        Volume stp_cancelled = 0;           //Resting qty killed by self-trade prevention
         bool rested = false;                //Leftover joined the book (limit only)
         bool accepted = true;               //False if the id was already live
         bool stp_halted = false;            //Cut short by SelfTradePolicy::CancelIncoming
@@ -154,7 +157,7 @@ namespace lob {
         //--- top of book / queries -------------------------------------
         std::optional<Price> best_bid() const;
         std::optional<Price> best_ask() const;
-        Quantity qty_at(Side side, Price price) const;
+        Volume qty_at(Side side, Price price) const;
         std::size_t order_count_at(Side side, Price price) const;
         const Order* find(OrderId id) const;
 

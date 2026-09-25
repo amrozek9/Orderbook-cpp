@@ -124,7 +124,10 @@ void OrderBook::remove(BookSide& book, const Locator& loc) {
 ExecReport OrderBook::submit(OrderId id, ParticipantId owner, Side side,
                              std::optional<Price> limit, Quantity qty, bool rest_leftover) {
     ExecReport rep;
-    if (order_index.count(id)) {        //Ids must be unique while live
+    //A zero-quantity order is a client bug, not a no-op: reject it so the
+    //caller finds out, rather than silently accepting an order that can
+    //never trade and never rests.
+    if (qty == 0 || order_index.count(id)) {    //Ids must be unique while live
         rep.accepted = false;
         rep.remaining = qty;
         return rep;
@@ -206,7 +209,7 @@ std::optional<Price> OrderBook::best_ask() const {
     return asks.begin()->first;
 }
 
-Quantity OrderBook::qty_at(Side side, Price price) const {
+Volume OrderBook::qty_at(Side side, Price price) const {
     if (side == Side::Buy) {
         auto it = bids.find(price);
         return it == bids.end() ? 0 : it->second.total_qty;
@@ -238,7 +241,7 @@ void OrderBook::check_side(const BookSide& book, Side side, std::size_t& counted
     for (const auto& [price, level] : book) {
         assert(!level.orders.empty() && "empty price level should have been erased");
 
-        Quantity sum = 0;
+        Volume sum = 0;
         for (const Order& o : level.orders) {
             assert(o.price == price && "order filed under the wrong price");
             assert(o.side == side && "order filed on the wrong side");
