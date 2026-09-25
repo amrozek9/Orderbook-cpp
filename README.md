@@ -74,14 +74,15 @@ path meaningful.
 ### Invariants are asserted in debug builds
 
 `OrderBook::check_invariants()` runs after every mutating call when `NDEBUG` is
-not defined, and compiles to nothing when it is. It checks that:
+not defined, and compiles to nothing when it is. Corruption is caught at the
+operation that caused it rather than three operations later. It checks that:
 
+- best bid is strictly below best ask, so the book never stays crossed;
 - each level's `total_qty` equals the sum of its orders' quantities;
-- no level is empty, and no resting order has zero quantity;
-- every resting order is filed under its own price and side;
-- `order_index.size()` equals the number of resting orders, and each index entry
-  points at the exact order object it claims to;
-- best bid is strictly below best ask -- the book is never crossed.
+- no level exists with zero orders or zero quantity;
+- the id index holds exactly one entry per resting order, and every locator
+  points at a live order with the price and side it claims;
+- every resting order has quantity greater than zero.
 
 Level aggregates are 64-bit (`lob::Volume`) while a single order's quantity is
 32-bit, because one level can hold many near-max orders. Summing them in the

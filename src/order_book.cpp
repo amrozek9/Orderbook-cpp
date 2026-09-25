@@ -256,6 +256,7 @@ void OrderBook::check_side(const BookSide& book, Side side, std::size_t& counted
             assert(&*it->second.order_iter == &o && "index iterator points elsewhere");
         }
         assert(sum == level.total_qty && "level total != sum of its orders");
+        assert(level.total_qty > 0 && "level exists with zero quantity");
         counted += level.orders.size();
     }
 }
