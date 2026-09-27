@@ -26,7 +26,7 @@ endif()
 
 find_package(Threads REQUIRED)
 
-add_library(lob src/order_book.cpp)
+add_library(lob src/order_book.cpp src/node_arena.cpp)
 target_include_directories(lob PUBLIC include)
 target_compile_options(lob PRIVATE -Wall -Wextra -Wpedantic)
 
@@ -55,7 +55,8 @@ add_executable(tests
     tests/test_order_book.cpp
     tests/test_differential.cpp
     tests/test_threading.cpp
-    tests/test_flow.cpp)
+    tests/test_flow.cpp
+    tests/test_node_arena.cpp)
 target_compile_options(tests PRIVATE -Wall -Wextra -Wpedantic)
 target_link_libraries(tests PRIVATE lob difftest_harness lob_flow
                       Catch2::Catch2WithMain Threads::Threads)

@@ -4,9 +4,12 @@
 #include <functional>
 #include <list>
 #include <map>
+#include <memory>
 #include <optional>
 #include <unordered_map>
 #include <vector>
+
+#include "lob/node_arena.hpp"
 
 //-----------------------------------------------------------------------------
 // Determinism contract
@@ -18,9 +21,11 @@
 // A/B benchmarking possible, so do not introduce any of the above.
 //
 // Trades leave through a fixed-capacity ring buffer (lob::TradeRing) that the
-// caller drains. Nothing in the matching path allocates, formats, or performs
-// I/O -- printing a fill inside the hot loop would make every measurement of it
-// meaningless.
+// caller drains. Nothing in the matching path formats or performs I/O --
+// printing a fill inside the hot loop would make every measurement of it
+// meaningless -- and container nodes come from a per-book NodeArena rather than
+// malloc, so a book provisioned with Config::expected_orders does not call the
+// system allocator while matching either.
 //
 // Threading: an OrderBook is not thread-safe. Distinct books share no state and
 // may run concurrently on separate threads; a single book may move between
@@ -59,15 +64,18 @@ namespace lob {
         Side side;
     };
 
+    using OrderList = std::list<Order, ArenaAllocator<Order>>;
+
     struct PriceLevel {
+        explicit PriceLevel(const ArenaAllocator<Order>& alloc) : orders(alloc) {}
         Volume total_qty = 0;
-        std::list<Order> orders;    //FIFO: front has time priority
+        OrderList orders;           //FIFO: front has time priority
     };
 
     struct Locator {
         Price price;
         Side side;
-        std::list<Order>::iterator order_iter;
+        OrderList::iterator order_iter;
     };
 
     //One fill. Always printed at the resting (maker) order's price.
@@ -123,11 +131,23 @@ namespace lob {
     struct Config {
         SelfTradePolicy self_trade = SelfTradePolicy::CancelResting;
         std::size_t trade_capacity = 4096;
+        //Container nodes come from a per-book NodeArena. False puts them back
+        //on the system allocator, to benchmark the difference. Always false
+        //under AddressSanitizer, so freed nodes stay poisoned and quarantined
+        //and a dangling locator is still caught.
+        bool pool_nodes = true;
+        //Resting orders to provision for at construction: the arena pre-faults
+        //room for this many and the id index reserves buckets for them, so a
+        //book that stays within it never allocates or rehashes while matching.
+        std::size_t expected_orders = 0;
     };
 
     class OrderBook {
     public:
         explicit OrderBook(Config cfg = {});
+        //Every container points into the book's own arena.
+        OrderBook(const OrderBook&) = delete;
+        OrderBook& operator=(const OrderBook&) = delete;
 
         //Match against the far side, then rest any leftover at `price`.
         ExecReport add_limit(OrderId id, ParticipantId owner, Side side, Price price, Quantity qty);
@@ -186,10 +206,21 @@ namespace lob {
         //debug builds (and runs after every mutating call); a no-op under NDEBUG.
         void check_invariants() const;
 
+        //True when container nodes come from the book's arena.
+        bool pools_nodes() const {return arena != nullptr;}
+
     private:
-        std::map<Price, PriceLevel, std::greater<Price>> bids; //Best bid first
-        std::map<Price, PriceLevel, std::less<Price>> asks;    //Best ask first
-        std::unordered_map<OrderId, Locator> order_index;      //OrderId -> where it rests
+        template <typename Compare>
+        using SideMap = std::map<Price, PriceLevel, Compare,
+                                  ArenaAllocator<std::pair<const Price, PriceLevel>>>;
+        using OrderIndex = std::unordered_map<OrderId, Locator, std::hash<OrderId>,
+                                              std::equal_to<OrderId>,
+                                              ArenaAllocator<std::pair<const OrderId, Locator>>>;
+
+        std::unique_ptr<NodeArena> arena;       //Null: system allocator. Outlives the containers
+        SideMap<std::greater<Price>> bids;      //Best bid first
+        SideMap<std::less<Price>> asks;         //Best ask first
+        OrderIndex order_index;                 //OrderId -> where it rests
 
         TradeRing trade_out;
         SelfTradePolicy policy;

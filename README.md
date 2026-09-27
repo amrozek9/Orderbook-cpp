@@ -2,7 +2,8 @@
 
 Price-time priority matching engine. Bids and asks are `std::map` keyed by price
 with opposite comparators, each price level holds a `std::list<Order>` in arrival
-order, and an `unordered_map<OrderId, Locator>` makes cancel-by-id O(1).
+order, and an `unordered_map<OrderId, Locator>` makes cancel-by-id O(1). All
+of their nodes come from a per-book arena rather than malloc.
 
 ```cpp
 lob::OrderBook book;
@@ -48,9 +49,9 @@ for the short `add_limit(id, side, price, qty)` overloads.
 ### Trade output goes through a ring buffer, never I/O
 
 Fills are written to a fixed-capacity `TradeRing` that the caller drains between
-orders. The matching loop does no allocation, no formatting, and no I/O — a
-`std::cout` or a per-order `std::vector` in there would dominate and invalidate
-every measurement of the path. `ExecReport` holds no container either; it
+orders. The matching loop does no formatting and no I/O -- and, with the node
+arena below, no allocation. A `std::cout` or a per-order `std::vector` in there
+would dominate and invalidate every measurement of the path. `ExecReport` holds no container either; it
 identifies this order's fills as `[first_seq, first_seq + trade_count)`.
 
 The ring allocates once, at construction. When it fills, the trade is **dropped
@@ -58,6 +59,40 @@ and counted** (`TradeRing::dropped()`) rather than lost quietly — a non-zero
 count means the caller undersized the ring or is draining too rarely, not that
 the book mismatched. Matching itself is unaffected: `ExecReport::filled` and the
 book state stay correct regardless.
+
+### Container nodes come from a per-book arena
+
+Every resting order costs a list node and a hash-map node, plus a map node when
+it opens a price level, and every cancel or fill frees them. Through malloc,
+that traffic is a large share of the latency tail -- measured, not assumed; see
+[Before and after](#before-and-after-the-allocation-tail). `lob::NodeArena`
+replaces it:
+
+- **One arena per book,** so there is still no global state, and distinct books
+  still run on distinct threads.
+- **LIFO free lists.** Nodes are carved from 64 KiB slabs and recycled through
+  one free list per 16-byte size class. The node a cancel frees is the next one
+  an add reuses, still in cache. There are no headers and no searches: the
+  containers hand the size back on deallocation.
+- **Provisioned up front.** Slabs are touched page by page as they are
+  allocated, and `Config::expected_orders` provisions them, and the id index's
+  buckets, at construction. A book that stays within its provision never calls
+  the system allocator or rehashes while matching. `tests/test_node_arena.cpp`
+  counts every call to `operator new` during a benchmark flow to prove it, and
+  runs the same flow on malloc to prove the counter works.
+
+The containers themselves are unchanged -- `std::map`, `std::list` and
+`std::unordered_map` with a stateful allocator -- so the matching logic and
+every test written against it are untouched. `Config::pool_nodes = false` puts
+the nodes back on malloc, which is how the benchmark produces both sides of its
+comparison from one binary. Under AddressSanitizer the arena is always bypassed,
+so freed nodes stay poisoned and quarantined and a dangling locator is still
+caught; debug builds scribble freed blocks with `0xDD` instead.
+
+The standard answer, `std::pmr::unsynchronized_pool_resource`, was tried first
+and made every percentile *worse*, p50 included (100 to 140 ns): glibc's
+per-thread cache is already fast, and a general-purpose pool's bookkeeping
+loses to it. What wins is a dedicated free list that does nothing else.
 
 ### The engine is a pure function of its input sequence
 
@@ -174,8 +209,9 @@ instrumented too.
 **AddressSanitizer + UndefinedBehaviorSanitizer.** The full suite and the fuzzer
 run clean. This matters here because the engine hands out `std::list` iterators
 as locators and erases list nodes during matching -- exactly the shape of code
-that produces use-after-free, and the same shape the intrusive lists and object
-pools of a later phase will have.
+that produces use-after-free. The node arena is bypassed in this build, so every
+node goes through ASan's own allocator, poisoned and quarantined when freed; the
+one test that needs the arena, the zero-allocation check, is skipped here.
 
 ```sh
 cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug -DLOB_SANITIZER=address
@@ -213,12 +249,25 @@ mean of 120 ns with a p99.9 of 300 ns, and an average cannot tell them apart.
 cmake -S . -B build-rel -DCMAKE_BUILD_TYPE=Release
 cmake --build build-rel -j
 ./build-rel/bench                          # 5 runs x 2M timed ops
-./build-rel/bench --runs 10 --ops 10000000 --depth 20000 --dump build-rel/samples.csv
+./build-rel/bench --runs 10 --ops 10000000 --depth 20000
 ```
 
 Options: `--ops`, `--warmup`, `--runs`, `--seed`, `--depth`, `--cpu` or
-`--no-pin`, `--prefault`, and `--dump`, which writes every timed sample as
-`run,index,kind,ns`. It refuses to run in a debug or sanitized build, where
+`--no-pin`, `--prefault`, `--system-alloc`, and `--dump`, which writes every
+sample -- engine and noise floor -- as `run,index,kind,ns`.
+
+`tools/plot_latency.py` turns dumps into the two figures below. It needs only
+Python 3:
+
+```sh
+./build-rel/bench --runs 3 --system-alloc --dump build-rel/malloc.csv
+./build-rel/bench --runs 3 --dump build-rel/arena.csv
+python3 tools/plot_latency.py --out docs/latency \
+    "system malloc=build-rel/malloc.csv" "node arena=build-rel/arena.csv"
+```
+
+A dump is about 40 bytes per sample, so three runs of 2M operations come to
+roughly 250 MB. Keep dumps in the build tree. It refuses to run in a debug or sanitized build, where
 `check_invariants()` walks the whole book after every operation and would be all
 it measured.
 
@@ -273,15 +322,17 @@ the output shows it worked.
 | Warm up | Each run replays 300,000 mixed operations (`--warmup`) through the same never-inlined timing loop before recording, so the branch predictor is trained on the exact code that is then timed | The header states the warm-up each run gets |
 | Pin to a core | `pthread_setaffinity_np` to `--cpu`, or else the last CPU allowed, since CPU 0 tends to take the most interrupts | The header names the CPU; it is re-checked after every run, and a run found elsewhere is flagged |
 | Fix the clock frequency | Reads the cpufreq governor and boost setting; warns unless the governor is `performance` and boost is off. Calibration spins for 200 ms right before the first run, so the core is at full speed | Printed in the header |
-| Pre-fault memory | Flow and sample buffers are written before timing. On glibc the heap is grown by 64 MiB (`--prefault`), every page touched, and trimming turned off, so engine allocations land on resident pages | Page faults during each timed pass are counted: 0 in every run |
+| Pre-fault memory | Flow and sample buffers are written before timing. The book is provisioned for twice the target depth, so its arena's slabs are allocated and touched at construction. On glibc the heap is also grown by 64 MiB (`--prefault`), every page touched, and trimming turned off, for anything still on malloc | Page faults during each timed pass are counted: 0 in every run |
 | `rdtscp`, not `std::chrono` | Each sample brackets one engine call between `lfence; rdtsc; lfence` and `rdtscp; lfence`, and is stored in ticks. Conversion to nanoseconds happens once, in the report | The header prints the TSC rate and resolution |
 | Subtract timer overhead | The median cost of an empty bracket, 96 ticks (30 ns) here, is subtracted from every sample | Printed in the header |
 | Repeat and report variance | 5 runs (`--runs`), each on a fresh book. The report gives the median of every percentile across runs, and each cell's spread | The spread table |
 
-The pre-fault is a guard for books larger than the default. At 5,000 orders the
-depth build already maps everything the timed pass touches, and faults are 0
-without it. With `--depth 200000`, the first run takes 13-15 page faults inside
-the timed pass without it, even after warm-up, and 0 with it.
+Both pre-faults are guards for books larger than the default. At 5,000 orders
+the depth build already maps everything the timed pass touches, and faults are 0
+without either. At `--depth 200000` on malloc (`--system-alloc`), the first run
+takes 13-15 page faults inside the timed pass without the heap pre-fault, even
+after warm-up, and 0 with it. The arena's provisioning does the same job for the
+book on its own: 0 faults at that depth even with `--prefault 0`.
 
 On the clock:
 
@@ -299,46 +350,46 @@ percentile.
 ### Results
 
 Ryzen 7 7735HS under WSL2, GCC 15 `-O3`, 5 runs of 2M operations over a book of
-about 5,000 orders:
+about 5,000 orders, on the node arena:
 
 ```
 runs (ns over all timed ops; page faults and context switches while timing)
-  run 1  p50 100  p99 441  p99.9 1,042  p99.99 20,538  max 1,574,932   faults 0  switches 1
-  run 2  p50 100  p99 431  p99.9 1,062  p99.99 20,027  max 1,321,548   faults 0  switches 1
-  run 3  p50 100  p99 441  p99.9 1,012  p99.99 20,808  max 1,620,885   faults 0  switches 1
-  run 4  p50 100  p99 441  p99.9 1,062  p99.99 20,888  max 2,177,633   faults 0  switches 0
-  run 5  p50 100  p99 431  p99.9 982  p99.99 20,377  max 1,684,380   faults 0  switches 0
+  run 1  p50 90  p99 301  p99.9 621  p99.99 20,600  max 1,284,940   faults 0  switches 0
+  run 2  p50 80  p99 301  p99.9 661  p99.99 19,638  max 812,075   faults 0  switches 0
+  run 3  p50 80  p99 311  p99.9 751  p99.99 19,157  max 377,793   faults 0  switches 1
+  run 4  p50 90  p99 321  p99.9 721  p99.99 20,570  max 628,486   faults 0  switches 0
+  run 5  p50 80  p99 301  p99.9 631  p99.99 19,378  max 1,069,809   faults 0  switches 0
 
 latency (ns), median of 5 runs
                     count      p50      p99    p99.9   p99.99        max
-  all           2,000,000      100      441    1,042   20,538  1,620,885
-  add             999,655      100      351      822   20,848    768,626
-  cancel          799,831       90      270      631   19,215  1,000,020
-  modify          100,354      190      461    1,082   21,249    260,201
-  marketable      100,160      160    1,032    2,164   21,860    449,044
-  (spin)        2,000,000      110      140      200   17,933    781,452
+  all           2,000,000       80      301      661   19,638    812,075
+  add             999,655       90      230      481   19,518    670,961
+  cancel          799,831       70      220      401   18,506    323,317
+  modify          100,354      160      371      681   21,141     80,727
+  marketable      100,160      130      661    1,212   21,101    152,025
+  (spin)        2,000,000      100      120      190   17,744  1,565,694
 
 spread across runs, (max - min) / median
                                 p50      p99    p99.9   p99.99        max
-  all                           0%       2%       8%       4%        53%
-  add                          10%       3%       6%       4%       187%
-  cancel                        0%       4%      27%      23%       116%
-  modify                        0%      11%      18%      25%       228%
-  marketable                    6%       5%      18%      44%       351%
-  (spin)                        0%      21%      35%       6%       284%
+  all                          12%       7%      20%       7%       112%
+  add                           0%       4%      31%      11%       177%
+  cancel                        0%       9%      35%      43%       288%
+  modify                        6%       5%      53%      46%      1237%
+  marketable                    8%      11%      42%      78%       380%
+  (spin)                        0%      42%      47%      12%       628%
 ```
 
-**p50 through p99.9 are the engine.** The spin row stays at 110-200 ns there,
+**p50 through p99.9 are the engine.** The spin row stays at 100-190 ns there,
 while the operations are several times that.
 
-**p99.99 and max are the machine.** Spinning for 110 ns with no engine involved
+**p99.99 and max are the machine.** Spinning for 100 ns with no engine involved
 still reaches 18 µs at p99.99, the same range as every operation type. A
 standalone check agrees: the count of multi-microsecond spikes grows in
 proportion to the length of the timed window, which is the signature of
 interrupts rather than of anything the code does.
 
-**What a result has to beat.** Overall p99 is stable to 2%, but per-type p99.9
-moves by up to 27% between runs. A change to the engine is real only when it
+**What a result has to beat.** Overall p99 is stable to 7%, but per-type p99.9
+moves by up to 53% between runs. A change to the engine is real only when it
 exceeds the spread of the cell it claims to improve. For example, a 3% gain in
 cancel p99.9 is noise here.
 
@@ -349,16 +400,48 @@ Linux:
 - `sudo cpupower frequency-set -g performance`, with boost off;
 - an isolated core (`isolcpus`, `nohz_full`), passed as `--cpu`.
 
-What the engine rows already say:
+What the engine rows say:
 
 - Modify costs about twice an add, because it is a cancel plus an add.
 - Marketable orders have a p99 three times an add's, because a sweep erases
   several orders and sometimes whole price levels.
-- Every add allocates a list node and a hash-map node, plus a map node when it
-  opens a new level. Every cancel frees them. Those allocations are the first
-  suspects for the p99 and p99.9, and the obvious target for the next round of
-  work. When that work brings object pools, they must be touched at
-  construction, for the same reason the heap is pre-faulted now.
+
+### Before and after: the allocation tail
+
+The same binary, the same flow and the same seed, with container nodes on malloc
+(`--system-alloc`) and then on the node arena. Three runs of 2M operations each:
+
+![Latency histogram: system malloc vs node arena](docs/latency-histogram.svg)
+
+On log-log axes the tail is visible rather than a sliver beside a spike. The two
+distributions peak together near 100 ns. From about 200 ns to 5 µs the malloc
+curve sits two to three times higher, and that gap is malloc and free: nothing
+else differs between the two runs. Past 10 µs both curves meet the gray one,
+which is a busy-wait with no engine at all -- interrupts and hypervisor exits,
+the machine rather than the code.
+
+![Latency by percentile: system malloc vs node arena](docs/latency-percentiles.svg)
+
+The same data by percentile. The curves separate from p90 onward and stay apart
+until about p99.98, where all three jump to the machine's floor together.
+
+Median of 5 runs each (ns). Only changes larger than both allocators'
+run-to-run spread are counted as results:
+
+| | p50 | p99 | p99.9 |
+|---|---|---|---|
+| all | 100 → 80 | 421 → 301 (−29%) | 972 → 661 (−32%) |
+| add | 100 → 90 | 331 → 230 (−31%) | 761 → 481 (−37%) |
+| cancel | 90 → 70 | 261 → 220 (−16%) | 501 → 401, within noise (35% spread) |
+| modify | 190 → 160 | 431 → 371 (−14%) | 902 → 681, within noise (53% spread) |
+| marketable | 160 → 130 | 1,002 → 661 (−34%) | 2,034 → 1,212, within noise (42% spread) |
+
+The allocator is not the whole tail. What remains at p99 is mostly cache
+misses: every operation chases pointers through a `std::map` of levels, a
+`std::list` per level and a hash bucket chain. At `--depth 200000`, where that
+working set outgrows the caches, both allocators sit near 1 µs at p99. Flatter
+structures -- intrusive order lists and price-indexed level arrays -- are the
+next target, and this benchmark is how to tell whether they work.
 
 ## Build
 

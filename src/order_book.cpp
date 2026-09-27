@@ -11,6 +11,36 @@ namespace {
         while (p < n) p <<= 1;
         return p;
     }
+
+#if defined(__SANITIZE_ADDRESS__)
+    constexpr bool kArenaAllowed = false;
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+    constexpr bool kArenaAllowed = false;
+#else
+    constexpr bool kArenaAllowed = true;
+#endif
+#else
+    constexpr bool kArenaAllowed = true;
+#endif
+
+    //Arena bytes one resting order can need: its list node, its hash-map node,
+    //and a map node in case it opens a level. Node layouts are the standard
+    //library's business, so this assumes a payload plus its links and rounds
+    //up to the arena's granule; provisioning only has to be generous.
+    constexpr std::size_t node_bytes(std::size_t payload, std::size_t links) {
+        const std::size_t raw = payload + links * sizeof(void*);
+        return (raw + NodeArena::kGranule - 1) / NodeArena::kGranule * NodeArena::kGranule;
+    }
+    constexpr std::size_t kBytesPerOrder =
+        node_bytes(sizeof(Order), 2) +
+        node_bytes(sizeof(std::pair<const OrderId, Locator>), 2) +
+        node_bytes(sizeof(std::pair<const Price, PriceLevel>), 4);
+
+    std::unique_ptr<NodeArena> make_arena(const Config& cfg) {
+        if (!kArenaAllowed || !cfg.pool_nodes) return nullptr;
+        return std::make_unique<NodeArena>(cfg.expected_orders * kBytesPerOrder);
+    }
 }
 
 //--- TradeRing ---------------------------------------------------------------
@@ -39,7 +69,13 @@ bool TradeRing::pop(Trade& out) {
 //--- OrderBook ---------------------------------------------------------------
 
 OrderBook::OrderBook(Config cfg)
-    : trade_out(cfg.trade_capacity), policy(cfg.self_trade) {}
+    : arena(make_arena(cfg)),
+      bids(std::greater<Price>{}, ArenaAllocator<PriceLevel>(arena.get())),
+      asks(std::less<Price>{}, ArenaAllocator<PriceLevel>(arena.get())),
+      order_index(ArenaAllocator<Locator>(arena.get())),
+      trade_out(cfg.trade_capacity), policy(cfg.self_trade) {
+    if (cfg.expected_orders > 0) order_index.reserve(cfg.expected_orders);
+}
 
 //Walk the opposite book best-price-first, filling `incoming` until it is
 //exhausted or the next level no longer crosses the limit.
@@ -107,7 +143,9 @@ void OrderBook::match(BookSide& opposite, Order& incoming,
 
 template <typename BookSide>
 void OrderBook::insert(BookSide& book, const Order& order) {
-    PriceLevel& level = book[order.price];
+    //try_emplace, not operator[]: a new level's list must share the arena.
+    PriceLevel& level = book.try_emplace(order.price, ArenaAllocator<Order>(arena.get()))
+                            .first->second;
     level.total_qty += order.qty;
     level.orders.push_back(order);
     order_index[order.id] = Locator{order.price, order.side, std::prev(level.orders.end())};

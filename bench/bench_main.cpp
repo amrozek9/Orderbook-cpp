@@ -8,7 +8,11 @@
 // max -- overall and per operation type. No mean is reported.
 //
 //   ./bench [--ops N] [--warmup N] [--runs R] [--seed S] [--depth D]
-//           [--cpu C | --no-pin] [--prefault MiB] [--dump FILE]
+//           [--cpu C | --no-pin] [--prefault MiB] [--system-alloc] [--dump FILE]
+//
+// --dump writes every timed sample, and every noise-floor sample, as CSV for
+// tools/plot_latency.py. --system-alloc puts the book's container nodes back
+// on malloc: the same binary then produces both sides of a before/after plot.
 //
 // Method, and how each part is checked rather than assumed:
 //
@@ -26,11 +30,12 @@
 //               with a warning unless they are fixed. Clock calibration spins
 //               for 200 ms just before the first run, so the core is at full
 //               clock when recording starts.
-//   Memory      The flow and sample buffers are written before timing. On
-//               glibc the heap is grown by --prefault MiB, every page touched,
-//               and trimming disabled, so engine allocations land on resident
-//               pages. Page faults and context switches are counted over each
-//               timed pass and reported.
+//   Memory      The flow and sample buffers are written before timing. The
+//               book is provisioned for twice the target depth, so its node
+//               arena is allocated and touched at construction. On glibc the
+//               heap is also grown by --prefault MiB, every page touched, and
+//               trimming disabled, for whatever still uses malloc. Page faults
+//               and context switches are counted over each timed pass.
 //   Clock       rdtscp, not std::chrono. Each sample brackets one engine call
 //               between fenced TSC reads and is stored in ticks; conversion to
 //               nanoseconds happens once, in the report. The median cost of an
@@ -320,8 +325,8 @@ struct RunResult {
 
 class Bench {
 public:
-    Bench(const flow::Flow& fl, const flow::Config& c)
-        : f(fl), cfg(c),
+    Bench(const flow::Flow& fl, const flow::Config& c, const lob::Config& book_config)
+        : f(fl), cfg(c), book_cfg(book_config),
           samples(std::max({f.build, f.warmup, f.timed_count()})),
           spin(f.timed_count()) {
         for (std::size_t k = 0; k < flow::kKinds; ++k) by_kind[k].reserve(f.stats.count[k]);
@@ -333,7 +338,7 @@ public:
     //measure the noise floor over the same number of samples.
     RunResult run(int cpu, std::FILE* dump, std::size_t index, double ticks_per_ns) {
         RunResult res;
-        lob::OrderBook book(lob::Config{cfg.self_trade, flow::kTradeCapacity});
+        lob::OrderBook book(book_cfg);
         std::uint64_t hash = flow::kHashSeed;
 
         time_ops(book, 0, f.build, hash);
@@ -362,6 +367,9 @@ public:
                 std::fprintf(dump, "%zu,%zu,%s,%.1f\n", index + 1, i,
                              flow::kind_name(f.ops[f.timed_begin() + i].kind),
                              static_cast<double>(samples[i]) / ticks_per_ns);
+            for (std::size_t i = 0; i < n; ++i)
+                std::fprintf(dump, "%zu,%zu,spin,%.1f\n", index + 1, i,
+                             static_cast<double>(spin[i]) / ticks_per_ns);
         }
 
         for (auto& v : by_kind) v.clear();
@@ -378,6 +386,7 @@ public:
 private:
     const flow::Flow& f;
     flow::Config cfg;
+    lob::Config book_cfg;
     std::uint64_t overhead = 0;
     std::vector<std::uint64_t> samples;     //Ticks, one per op of the current pass
     std::vector<std::uint64_t> spin;
@@ -514,7 +523,7 @@ void print_summary(const std::vector<RunResult>& runs, const flow::Flow& f, doub
 [[noreturn]] void usage(const char* argv0) {
     std::fprintf(stderr,
         "usage: %s [--ops N] [--warmup N] [--runs R] [--seed S] [--depth D]\n"
-        "          [--cpu C | --no-pin] [--prefault MiB] [--dump FILE]\n"
+        "          [--cpu C | --no-pin] [--prefault MiB] [--system-alloc] [--dump FILE]\n"
         "  --ops       timed operations per run (default 2000000)\n"
         "  --warmup    mixed operations run before recording (default 300000)\n"
         "  --runs      repetitions, each on a fresh book (default 5)\n"
@@ -523,7 +532,8 @@ void print_summary(const std::vector<RunResult>& runs, const flow::Flow& f, doub
         "  --cpu       pin to this CPU (default: the last one allowed)\n"
         "  --no-pin    do not pin\n"
         "  --prefault  MiB of heap to pre-fault on glibc (default 64)\n"
-        "  --dump      write every timed sample as CSV: run,index,kind,ns\n", argv0);
+        "  --system-alloc  container nodes from malloc, not the book's arena\n"
+        "  --dump      write every sample as CSV: run,index,kind,ns\n", argv0);
     std::exit(2);
 }
 
@@ -549,6 +559,7 @@ int main(int argc, char** argv) {
     std::size_t runs = 5;
     std::size_t prefault_mib = 64;
     int cpu = default_cpu();
+    bool system_alloc = false;
     const char* dump_path = nullptr;
     for (int i = 1; i < argc; ++i) {
         const auto value = [&]() -> const char* {
@@ -563,6 +574,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--cpu"))      cpu = std::atoi(value());
         else if (!std::strcmp(argv[i], "--no-pin"))   cpu = -1;
         else if (!std::strcmp(argv[i], "--prefault")) prefault_mib = std::strtoull(value(), nullptr, 10);
+        else if (!std::strcmp(argv[i], "--system-alloc")) system_alloc = true;
         else if (!std::strcmp(argv[i], "--dump"))     dump_path = value();
         else usage(argv[0]);
     }
@@ -579,7 +591,14 @@ int main(int argc, char** argv) {
     const flow::Flow f = flow::generate(cfg);
     const double gen_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - g0).count();
     const flow::Stats& st = f.stats;
-    Bench bench(f, cfg);
+
+    //Provisioned for twice the target depth, which the flow never reaches, so
+    //the arena and the id index are sized once, at construction.
+    lob::Config book_cfg{cfg.self_trade, flow::kTradeCapacity};
+    book_cfg.pool_nodes = !system_alloc;
+    book_cfg.expected_orders = system_alloc ? 0 : 2 * cfg.target_depth;
+    const bool pooled = lob::OrderBook(book_cfg).pools_nodes();
+    Bench bench(f, cfg, book_cfg);
     const std::size_t prefaulted = prefault_heap(prefault_mib);
 
     std::FILE* dump = nullptr;
@@ -604,6 +623,11 @@ int main(int argc, char** argv) {
                 "(%.1f ns), subtracted\n", ticks_per_ns,
                 static_cast<double>(resolution) / ticks_per_ns, (unsigned long long)overhead,
                 static_cast<double>(overhead) / ticks_per_ns);
+    if (pooled)
+        std::printf("  allocator   per-book node arena, provisioned for %s orders\n",
+                    grouped(book_cfg.expected_orders).c_str());
+    else
+        std::printf("  allocator   system malloc for container nodes (--system-alloc)\n");
     if (prefaulted)
         std::printf("  memory      %zu MiB of heap pre-faulted, trimming off\n", prefaulted);
     else
