@@ -670,6 +670,7 @@ operation type. Only cells the sign test marks count.
 | 16-byte price levels instead of 24 (15 pairs) | 50 → 50 | 190 → 190, not significant | 401 → 401, not significant | nothing significant at either depth |
 | *Rejected:* order path specialized on side (15 pairs) | 50 → 50 | 190 → 190, not significant | 421 → 431, not significant | marketable p50 90 → 100 and p99 401 → 421, both significantly **worse**. Reverted |
 | Profile-guided branch hints (15 pairs) | 50 → 50 | 190 → 190, not significant | 401 → 411, not significant | add p99 −8% and p99.9 −7%; on a 200,000-order book, add p99 −6% and modify p50 −11% |
+| *Rejected:* branchless queue unlink (15 pairs) | 50 → 50 | 220 → 220, not significant | 581 → 571, not significant | modify p50 90 → 80; nothing at 200,000 orders, where p99 leaned slightly worse. Not adopted |
 
 Each row is its own paired measurement, so a row's "before" need not equal the
 previous row's "after". The machine drifts between sessions, which is why a
@@ -862,6 +863,38 @@ cancel           40 ->    40   +0%  0/15      511 ->   501   -2%  7/15      771 
 modify           90 ->    80  -11% 11/15*     691 ->   671   -3%  8/15    1,172 -> 1,062   -9%  7/15 
 marketable      170 ->   160   -6%  7/15    1,072 -> 1,062   -1%  9/15    1,924 -> 1,904   -1% 12/15*
 ```
+
+The least predictable branches left are the two link fixups when an order is
+unlinked from its queue, 80/20 and 62/38 by count. They were the natural
+candidate for branch-free code. A plain ternary did not get there: GCC turned it
+back into jumps, and added some. Only selecting the address with a bit mask
+compiled to two conditional moves and no jumps. Measured against the hinted
+build, it bought one modify p50 step and nothing else:
+
+```
+                                    p50                         p99                       p99.9
+all              50 ->    50   +0%  0/15      220 ->   220   +0%  8/15      581 ->   571   -2%  9/15 
+add              50 ->    50   +0%  0/15      130 ->   130   +0%  3/15      391 ->   381   -3%  9/15 
+cancel           40 ->    40   +0%  4/15      160 ->   160   +0%  6/15      521 ->   521   +0%  7/15 
+modify           90 ->    80  -11%  9/15*     281 ->   270   -4%  6/15      831 ->   791   -5%  6/15 
+marketable      100 ->    90  -10%  3/15      521 ->   501   -4%  5/15    1,262 -> 1,312   +4%  5/15 
+```
+
+And on the 200,000-order book:
+
+```
+                                    p50                         p99                       p99.9
+all              50 ->    50   +0%  0/15      591 ->   611   +3%  5/15    1,362 -> 1,342   -1%  9/15 
+add              50 ->    50   +0%  0/15      190 ->   200   +5%  4/15      441 ->   431   -2%  7/15 
+cancel           40 ->    40   +0%  0/15      581 ->   591   +2%  5/15    1,533 -> 1,473   -4%  9/15 
+modify           80 ->    80   +0%  3/15      751 ->   761   +1%  6/15    1,974 -> 1,783  -10%  9/15 
+marketable      180 ->   180   +0%  3/15    1,212 -> 1,242   +2%  5/15    2,444 -> 2,444   +0%  9/15 
+```
+
+The counts looked unpredictable, but the patterns are not. A cancel usually
+unlinks one of the newest orders, the tail of its queue, and a fill always
+takes the head. The predictor learns that, so the branches were nearly free,
+and the masked version was not adopted.
 
 ### Before and after: the allocation tail
 
