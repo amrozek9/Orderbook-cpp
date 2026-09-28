@@ -58,6 +58,9 @@ int main(int argc, char** argv) {
         const Window& w = windows[(seed / 3) % std::size(windows)];
         engine.price_levels = w.levels;
         engine.price_base = w.base;
+        //Every other rotation starts the order pool at one slot, so it grows
+        //and moves its orders while the sequence runs.
+        if ((seed / 15) % 2) engine.expected_orders = 1;
         const auto ops = difftest::Generator(seed, cfg).generate();
 
         if (difftest::diverges(ops, engine)) {

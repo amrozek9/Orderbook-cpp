@@ -25,18 +25,20 @@ namespace {
     constexpr bool kArenaAllowed = true;
 #endif
 
-    //Arena bytes one resting order can need: its list node, its hash-map node,
-    //and a map node in case it opens a level. Node layouts are the standard
-    //library's business, so this assumes a payload plus its links and rounds
-    //up to the arena's granule; provisioning only has to be generous.
+    //Arena bytes one resting order can need: its hash-map node, and a map node
+    //in case it opens a level outside the price window. The order itself lives
+    //in the slot pool. Node layouts are the standard library's business, so
+    //this assumes a payload plus its links and rounds up to the arena's
+    //granule; provisioning only has to be generous.
     constexpr std::size_t node_bytes(std::size_t payload, std::size_t links) {
         const std::size_t raw = payload + links * sizeof(void*);
         return (raw + NodeArena::kGranule - 1) / NodeArena::kGranule * NodeArena::kGranule;
     }
     constexpr std::size_t kBytesPerOrder =
-        node_bytes(sizeof(Order), 2) +
-        node_bytes(sizeof(std::pair<const OrderId, Locator>), 2) +
+        node_bytes(sizeof(std::pair<const OrderId, SlotIndex>), 2) +
         node_bytes(sizeof(std::pair<const Price, PriceLevel>), 4);
+
+    constexpr std::size_t kDefaultPoolSlots = 1024;
 
     std::unique_ptr<NodeArena> make_arena(const Config& cfg) {
         if (!kArenaAllowed || !cfg.pool_nodes) return nullptr;
@@ -56,11 +58,8 @@ namespace {
 //--- PriceLadder -------------------------------------------------------------
 
 template <bool IsBid>
-PriceLadder<IsBid>::PriceLadder(std::size_t window_levels, NodeArena* a)
-    : arena(a), overflow(Ranking{}, ArenaAllocator<PriceLevel>(a)) {
-    window.reserve(window_levels);
-    for (std::size_t i = 0; i < window_levels; ++i) window.emplace_back(ArenaAllocator<Order>(a));
-}
+PriceLadder<IsBid>::PriceLadder(std::size_t window_levels, NodeArena* arena)
+    : window(window_levels), overflow(Ranking{}, ArenaAllocator<PriceLevel>(arena)) {}
 
 template <bool IsBid>
 void PriceLadder<IsBid>::place(Price base) {
@@ -78,8 +77,9 @@ void PriceLadder<IsBid>::check() const {
     std::size_t count = 0;
     for (std::size_t i = 0; i < window.size(); ++i) {
         const PriceLevel& level = window[i];
-        if (level.orders.empty()) {
+        if (level.empty()) {
             assert(level.total_qty == 0 && "empty array slot still holds quantity");
+            assert(level.count == 0 && level.tail == kNoSlot && "empty array slot still holds orders");
             continue;
         }
         assert(i < limit && "occupied slot beyond the placed window");
@@ -87,10 +87,10 @@ void PriceLadder<IsBid>::check() const {
         assert(!(IsBid ? i > best_idx : i < best_idx) && "best index is not the best level");
     }
     assert(count == occupied && "occupied count out of step with the array");
-    if (occupied > 0) assert(!window[best_idx].orders.empty() && "best index points at an empty slot");
+    if (occupied > 0) assert(!window[best_idx].empty() && "best index points at an empty slot");
     for (const auto& [price, level] : overflow) {
         assert(!in_window(price) && "a price inside the window was filed in the map");
-        assert(!level.orders.empty() && "empty level left in the map");
+        assert(!level.empty() && "empty level left in the map");
     }
 }
 #else
@@ -128,9 +128,10 @@ bool TradeRing::pop(Trade& out) {
 
 OrderBook::OrderBook(Config cfg)
     : arena(make_arena(cfg)),
+      pool(cfg.expected_orders > 0 ? cfg.expected_orders : kDefaultPoolSlots),
       bids(cfg.price_levels, arena.get()),
       asks(cfg.price_levels, arena.get()),
-      order_index(ArenaAllocator<Locator>(arena.get())),
+      order_index(ArenaAllocator<SlotIndex>(arena.get())),
       trade_out(cfg.trade_capacity), policy(cfg.self_trade) {
     if (cfg.expected_orders > 0) order_index.reserve(cfg.expected_orders);
     if (cfg.price_base) {
@@ -162,8 +163,9 @@ void OrderBook::match(BookSide& opposite, Order& incoming,
         if (!best || !crosses(level_price)) break;
 
         PriceLevel& level = *best;
-        while (incoming.qty > 0 && !level.orders.empty()) {
-            Order& resting = level.orders.front();      //Oldest wins
+        while (incoming.qty > 0 && !level.empty()) {
+            const SlotIndex slot = level.head;          //Oldest wins
+            Order& resting = pool[slot].value;
 
             const bool self_trade = policy != SelfTradePolicy::Allow &&
                                     incoming.owner != kAnonymous &&
@@ -179,9 +181,8 @@ void OrderBook::match(BookSide& opposite, Order& incoming,
                 }
                 //CancelResting: drop the maker, no trade, keep walking.
                 rep.stp_cancelled += resting.qty;
-                level.total_qty -= resting.qty;
                 order_index.erase(resting.id);
-                level.orders.pop_front();
+                detach(level, slot);
                 continue;
             }
 
@@ -201,32 +202,55 @@ void OrderBook::match(BookSide& opposite, Order& incoming,
 
             if (resting.qty == 0) {                     //Fully consumed
                 order_index.erase(resting.id);
-                level.orders.pop_front();
+                detach(level, slot);
             }
         }
 
-        if (level.orders.empty()) opposite.closed(level_price);
+        if (level.empty()) opposite.closed(level_price);
         if (rep.stp_halted) break;
     }
+}
+
+void OrderBook::append(PriceLevel& level, SlotIndex slot) {
+    auto& s = pool[slot];
+    s.prev = level.tail;
+    s.next = kNoSlot;
+    if (level.tail != kNoSlot) pool[level.tail].next = slot;
+    else                       level.head = slot;
+    level.tail = slot;
+    ++level.count;
+    level.total_qty += s.value.qty;
+}
+
+void OrderBook::detach(PriceLevel& level, SlotIndex slot) {
+    const auto& s = pool[slot];
+    if (s.prev != kNoSlot) pool[s.prev].next = s.next;
+    else                   level.head = s.next;
+    if (s.next != kNoSlot) pool[s.next].prev = s.prev;
+    else                   level.tail = s.prev;
+    --level.count;
+    level.total_qty -= s.value.qty;
+    pool.release(slot);
 }
 
 template <typename BookSide>
 void OrderBook::insert(BookSide& book, const Order& order) {
     if (!book.placed()) place_windows(order.price);     //First order to rest
     PriceLevel& level = book.open(order.price);
-    level.total_qty += order.qty;
-    level.orders.push_back(order);
-    order_index[order.id] = Locator{order.price, order.side, std::prev(level.orders.end())};
+    const SlotIndex slot = pool.acquire();
+    pool[slot].value = order;
+    append(level, slot);
+    order_index[order.id] = slot;
 }
 
 template <typename BookSide>
-void OrderBook::remove(BookSide& book, const Locator& loc) {
-    PriceLevel* level = book.find(loc.price);
+void OrderBook::remove(BookSide& book, SlotIndex slot) {
+    const Price price = pool[slot].value.price;
+    PriceLevel* level = book.find(price);
     if (!level) return;
 
-    level->total_qty -= loc.order_iter->qty;
-    level->orders.erase(loc.order_iter);
-    if (level->orders.empty()) book.closed(loc.price);
+    detach(*level, slot);
+    if (level->empty()) book.closed(price);
 }
 
 ExecReport OrderBook::submit(OrderId id, ParticipantId owner, Side side,
@@ -280,10 +304,10 @@ bool OrderBook::cancel(OrderId id) {
     auto it = order_index.find(id);
     if (it == order_index.end()) return false;
 
-    const Locator loc = it->second;
+    const SlotIndex slot = it->second;
     order_index.erase(it);
-    if (loc.side == Side::Buy) remove(bids, loc);
-    else                       remove(asks, loc);
+    if (pool[slot].value.side == Side::Buy) remove(bids, slot);
+    else                                    remove(asks, slot);
     check_invariants();
     return true;
 }
@@ -297,8 +321,8 @@ ExecReport OrderBook::modify(OrderId id, Price new_price, Quantity new_qty) {
         return rep;
     }
 
-    const Side side = it->second.side;
-    const ParticipantId owner = it->second.order_iter->owner;
+    const Side side = pool[it->second].value.side;
+    const ParticipantId owner = pool[it->second].value.owner;
     cancel(id);
     if (new_qty == 0) return rep;       //Modify to zero is just a cancel
 
@@ -318,13 +342,13 @@ Volume OrderBook::qty_at(Side side, Price price) const {
 
 std::size_t OrderBook::order_count_at(Side side, Price price) const {
     const PriceLevel* level = side == Side::Buy ? bids.find(price) : asks.find(price);
-    return level ? level->orders.size() : 0;
+    return level ? level->count : 0;
 }
 
 const Order* OrderBook::find(OrderId id) const {
     auto it = order_index.find(id);
     if (it == order_index.end()) return nullptr;
-    return &*it->second.order_iter;
+    return &pool[it->second].value;
 }
 
 //--- invariants --------------------------------------------------------------
@@ -334,25 +358,31 @@ template <typename BookSide>
 void OrderBook::check_side(const BookSide& book, Side side, std::size_t& counted) const {
     book.check();
     book.for_each_level([&](Price price, const PriceLevel& level) {
-        assert(!level.orders.empty() && "empty price level should have been erased");
+        assert(!level.empty() && "empty price level should have been erased");
 
         Volume sum = 0;
-        for (const Order& o : level.orders) {
+        std::size_t in_queue = 0;
+        SlotIndex prev = kNoSlot;
+        for (SlotIndex i = level.head; i != kNoSlot; i = pool[i].next) {
+            const Order& o = pool[i].value;
+            assert(pool[i].prev == prev && "queue's back link disagrees with its forward link");
             assert(o.price == price && "order filed under the wrong price");
             assert(o.side == side && "order filed on the wrong side");
             assert(o.qty > 0 && "fully filled order still resting");
             sum += o.qty;
+            ++in_queue;
+            prev = i;
 
-            //The index points at this exact order.
+            //The index points at this exact slot.
             auto it = order_index.find(o.id);
             assert(it != order_index.end() && "resting order missing from the index");
-            assert(it->second.price == price);
-            assert(it->second.side == side);
-            assert(&*it->second.order_iter == &o && "index iterator points elsewhere");
+            assert(it->second == i && "index points at a different slot");
         }
+        assert(prev == level.tail && "level's tail is not its last order");
+        assert(in_queue == level.count && "level's count != orders in its queue");
         assert(sum == level.total_qty && "level total != sum of its orders");
         assert(level.total_qty > 0 && "level exists with zero quantity");
-        counted += level.orders.size();
+        counted += in_queue;
     });
 }
 
@@ -361,6 +391,8 @@ void OrderBook::check_invariants() const {
     check_side(bids, Side::Buy, counted);
     check_side(asks, Side::Sell, counted);
     assert(counted == order_index.size() && "index size != number of resting orders");
+    assert(pool.size() == counted && "pool holds slots that no queue reaches");
+    assert(pool.consistent() && "order pool free list is corrupt");
 
     const auto bid = bids.best_price();
     const auto ask = asks.best_price();

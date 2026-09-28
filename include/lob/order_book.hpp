@@ -2,7 +2,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
-#include <list>
 #include <map>
 #include <memory>
 #include <optional>
@@ -12,6 +11,7 @@
 #include <vector>
 
 #include "lob/node_arena.hpp"
+#include "lob/slot_pool.hpp"
 
 //-----------------------------------------------------------------------------
 // Determinism contract
@@ -25,9 +25,10 @@
 // Trades leave through a fixed-capacity ring buffer (lob::TradeRing) that the
 // caller drains. Nothing in the matching path formats or performs I/O --
 // printing a fill inside the hot loop would make every measurement of it
-// meaningless -- and container nodes come from a per-book NodeArena rather than
-// malloc, so a book provisioned with Config::expected_orders does not call the
-// system allocator while matching either.
+// meaningless. Orders live in a pre-allocated slot pool and the remaining
+// container nodes come from a per-book NodeArena, so a book provisioned with
+// Config::expected_orders does not call the system allocator while matching
+// either.
 //
 // Threading: an OrderBook is not thread-safe. Distinct books share no state and
 // may run concurrently on separate threads; a single book may move between
@@ -66,18 +67,16 @@ namespace lob {
         Side side;
     };
 
-    using OrderList = std::list<Order, ArenaAllocator<Order>>;
-
+    //The resting orders at one price, as a FIFO queue threaded through the
+    //book's order pool by slot index: head has time priority, and each slot
+    //holds its neighbours' indices. 24 bytes, so a flat array of levels packs
+    //two and a half to a cache line.
     struct PriceLevel {
-        explicit PriceLevel(const ArenaAllocator<Order>& alloc) : orders(alloc) {}
         Volume total_qty = 0;
-        OrderList orders;           //FIFO: front has time priority
-    };
-
-    struct Locator {
-        Price price;
-        Side side;
-        OrderList::iterator order_iter;
+        SlotIndex head = kNoSlot;   //Oldest
+        SlotIndex tail = kNoSlot;   //Newest
+        std::uint32_t count = 0;    //Orders in the queue
+        bool empty() const {return head == kNoSlot;}
     };
 
     //One side of the book.
@@ -111,18 +110,18 @@ namespace lob {
         PriceLevel& open(Price price) {
             if (in_window(price)) {
                 const std::size_t i = price - lo;
-                if (window[i].orders.empty()) note_opened(i);
+                if (window[i].empty()) note_opened(i);
                 return window[i];
             }
             ++outside_opens;
-            return overflow.try_emplace(price, ArenaAllocator<Order>(arena)).first->second;
+            return overflow.try_emplace(price).first->second;
         }
 
         //The level at `price`, or nullptr when nothing rests there.
         const PriceLevel* find(Price price) const {
             if (in_window(price)) {
                 const PriceLevel& level = window[price - lo];
-                return level.orders.empty() ? nullptr : &level;
+                return level.empty() ? nullptr : &level;
             }
             const auto it = overflow.find(price);
             return it == overflow.end() ? nullptr : &it->second;
@@ -179,10 +178,10 @@ namespace lob {
             if (occupied > 0) {
                 if constexpr (IsBid) {
                     for (std::size_t i = best_idx + 1; i-- > 0;)
-                        if (!window[i].orders.empty()) fn(lo + i, window[i]);
+                        if (!window[i].empty()) fn(lo + i, window[i]);
                 } else {
                     for (std::size_t i = best_idx; i < limit; ++i)
-                        if (!window[i].orders.empty()) fn(lo + i, window[i]);
+                        if (!window[i].empty()) fn(lo + i, window[i]);
                 }
             }
             for (; it != overflow.end(); ++it) fn(it->first, it->second);
@@ -213,14 +212,13 @@ namespace lob {
         //exists, so the scan needs no bounds check.
         std::size_t next_occupied(std::size_t i) const {
             if constexpr (IsBid) {
-                do --i; while (window[i].orders.empty());
+                do --i; while (window[i].empty());
             } else {
-                do ++i; while (window[i].orders.empty());
+                do ++i; while (window[i].empty());
             }
             return i;
         }
 
-        NodeArena* arena;
         std::vector<PriceLevel> window;         //Allocated up front; empty slots are absent levels
         Overflow overflow;                      //Levels outside the window, best first
         Price lo = 0;                           //Window base
@@ -289,13 +287,15 @@ namespace lob {
         //under AddressSanitizer, so freed nodes stay poisoned and quarantined
         //and a dangling locator is still caught.
         bool pool_nodes = true;
-        //Resting orders to provision for at construction: the arena pre-faults
-        //room for this many and the id index reserves buckets for them, so a
-        //book that stays within it never allocates or rehashes while matching.
+        //Resting orders to provision for at construction: the order pool
+        //allocates and touches this many slots, the arena pre-faults room for
+        //their index entries, and the index reserves buckets. A book that stays
+        //within it never allocates or rehashes while matching. 0 starts the
+        //pool at 1,024 slots, doubling as needed.
         std::size_t expected_orders = 0;
         //Consecutive prices, in ticks, whose levels live in each side's flat
         //array. Prices outside fall back to a std::map: correct, but slower.
-        //Each level costs 40 bytes per side, allocated at construction. 0 puts
+        //Each level costs 24 bytes per side, allocated at construction. 0 puts
         //every level in the map.
         std::size_t price_levels = 1024;
         //The window's lowest price. Unset, the window is centred on the first
@@ -345,6 +345,8 @@ namespace lob {
         std::optional<Price> best_ask() const;
         Volume qty_at(Side side, Price price) const;
         std::size_t order_count_at(Side side, Price price) const;
+        //The resting order, or nullptr. The pointer is valid until the next
+        //call that changes the book: a growing order pool moves its orders.
         const Order* find(OrderId id) const;
 
         std::size_t size() const {return order_index.size();}
@@ -357,7 +359,8 @@ namespace lob {
         template <typename F>
         void for_each_resting(F&& fn) const {
             const auto visit = [&](Price, const PriceLevel& level) {
-                for (const Order& o : level.orders) fn(o);
+                for (SlotIndex i = level.head; i != kNoSlot; i = pool[i].next)
+                    fn(pool[i].value);
             };
             bids.for_each_level(visit);
             asks.for_each_level(visit);
@@ -382,15 +385,22 @@ namespace lob {
         //True when container nodes come from the book's arena.
         bool pools_nodes() const {return arena != nullptr;}
 
+        //--- order pool ------------------------------------------------
+        std::size_t order_pool_capacity() const {return pool.capacity();}
+        //Times the pool ran out and doubled, copying every order: a stall
+        //that sizing Config::expected_orders correctly avoids.
+        std::uint64_t order_pool_growths() const {return pool.growths();}
+
     private:
-        using OrderIndex = std::unordered_map<OrderId, Locator, std::hash<OrderId>,
+        using OrderIndex = std::unordered_map<OrderId, SlotIndex, std::hash<OrderId>,
                                               std::equal_to<OrderId>,
-                                              ArenaAllocator<std::pair<const OrderId, Locator>>>;
+                                              ArenaAllocator<std::pair<const OrderId, SlotIndex>>>;
 
         std::unique_ptr<NodeArena> arena;       //Null: system allocator. Outlives the containers
+        SlotPool<Order> pool;                   //Every resting order, and its queue links
         PriceLadder<true> bids;
         PriceLadder<false> asks;
-        OrderIndex order_index;                 //OrderId -> where it rests
+        OrderIndex order_index;                 //OrderId -> its slot in the pool
 
         TradeRing trade_out;
         SelfTradePolicy policy;
@@ -405,7 +415,12 @@ namespace lob {
         void insert(BookSide& book, const Order& order);
 
         template <typename BookSide>
-        void remove(BookSide& book, const Locator& loc);
+        void remove(BookSide& book, SlotIndex slot);
+
+        //Queue maintenance. append takes a filled-in slot; detach unlinks a
+        //slot, subtracts its remaining quantity from the level, and frees it.
+        void append(PriceLevel& level, SlotIndex slot);
+        void detach(PriceLevel& level, SlotIndex slot);
 
         template <typename BookSide>
         void check_side(const BookSide& book, Side side, std::size_t& counted) const;

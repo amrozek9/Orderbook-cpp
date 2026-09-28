@@ -12,10 +12,11 @@
 //           [--price-levels N] [--dump FILE]
 //
 // --dump writes every timed sample, and every noise-floor sample, as CSV for
-// tools/plot_latency.py. --system-alloc puts the book's container nodes back
-// on malloc, and --price-levels 0 files every price level in a std::map
-// instead of the flat array: the same binary then produces both sides of a
-// before/after comparison for either change.
+// tools/plot_latency.py. --system-alloc puts the id index's and fallback
+// map's nodes back on malloc (orders always live in the book's slot pool), and
+// --price-levels 0 files every price level in a std::map instead of the flat
+// array: the same binary then produces both sides of a before/after
+// comparison for either change.
 //
 // Method, and how each part is checked rather than assumed:
 //
@@ -327,6 +328,7 @@ struct RunResult {
     std::uint64_t dropped = 0;
     std::optional<lob::Price> window_base;      //Where the flat price array landed
     std::uint64_t opened_outside = 0;           //Levels that fell back to the map
+    std::uint64_t pool_growths = 0;             //Times the order pool ran out
 };
 
 class Bench {
@@ -369,6 +371,7 @@ public:
         res.dropped = book.trades().dropped();
         res.window_base = book.price_window_base();
         res.opened_outside = book.levels_opened_outside_window();
+        res.pool_growths = book.order_pool_growths();
 
         if (dump) {
             for (std::size_t i = 0; i < n; ++i)
@@ -541,7 +544,7 @@ void print_summary(const std::vector<RunResult>& runs, const flow::Flow& f, doub
         "  --cpu       pin to this CPU (default: the last one allowed)\n"
         "  --no-pin    do not pin\n"
         "  --prefault  MiB of heap to pre-fault on glibc (default 64)\n"
-        "  --system-alloc  container nodes from malloc, not the book's arena\n"
+        "  --system-alloc  index and map nodes from malloc, not the book's arena\n"
         "  --price-levels  prices in the flat array, centred on the first resting\n"
         "              order (default 4096); 0 puts every level in a std::map\n"
         "  --dump      write every sample as CSV: run,index,kind,ns\n", argv0);
@@ -609,7 +612,7 @@ int main(int argc, char** argv) {
     //the arena and the id index are sized once, at construction.
     lob::Config book_cfg{cfg.self_trade, flow::kTradeCapacity};
     book_cfg.pool_nodes = !system_alloc;
-    book_cfg.expected_orders = system_alloc ? 0 : 2 * cfg.target_depth;
+    book_cfg.expected_orders = 2 * cfg.target_depth;
     //Wide enough that the flow's slowly walking mid never leaves it; the
     //report counts any level that does.
     book_cfg.price_levels = price_levels;
@@ -639,11 +642,9 @@ int main(int argc, char** argv) {
                 "(%.1f ns), subtracted\n", ticks_per_ns,
                 static_cast<double>(resolution) / ticks_per_ns, (unsigned long long)overhead,
                 static_cast<double>(overhead) / ticks_per_ns);
-    if (pooled)
-        std::printf("  allocator   per-book node arena, provisioned for %s orders\n",
-                    grouped(book_cfg.expected_orders).c_str());
-    else
-        std::printf("  allocator   system malloc for container nodes (--system-alloc)\n");
+    std::printf("  allocator   orders in a pool of %s slots; index and map nodes from %s\n",
+                grouped(book_cfg.expected_orders).c_str(),
+                pooled ? "the book's arena" : "malloc (--system-alloc)");
     if (prefaulted)
         std::printf("  memory      %zu MiB of heap pre-faulted, trimming off\n", prefaulted);
     else
@@ -689,8 +690,14 @@ int main(int argc, char** argv) {
     }
     std::printf("  trade stream %016llx in every run, matching the generator\n",
                 (unsigned long long)st.trade_hash);
-    std::uint64_t outside = 0;
-    for (const RunResult& r : results) outside = std::max(outside, r.opened_outside);
+    std::uint64_t outside = 0, growths = 0;
+    for (const RunResult& r : results) {
+        outside = std::max(outside, r.opened_outside);
+        growths = std::max(growths, r.pool_growths);
+    }
+    std::printf("  orders       pool never outgrew its %s slots%s\n",
+                grouped(book_cfg.expected_orders).c_str(),
+                growths ? (": WARNING, grew " + std::to_string(growths) + " times").c_str() : "");
     if (price_levels == 0)
         std::printf("  prices       no flat array (--price-levels 0): every level in a std::map\n");
     else if (results.front().window_base)

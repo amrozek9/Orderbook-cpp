@@ -129,6 +129,18 @@ TEST_CASE("Differential: a window pressed against the top of the price range") {
     sweep(360000, 800, cfg, window(4, std::nullopt));
 }
 
+//--- the order pool ------------------------------------------------------------
+
+TEST_CASE("Differential: an order pool that starts at one slot and keeps growing") {
+    //Every add past the first may double the pool and move every order, so a
+    //stale slot index or a link fixed up in the wrong copy shows up at once.
+    lob::Config engine = difftest::engine_config(SelfTradePolicy::CancelResting);
+    engine.expected_orders = 1;
+    GenConfig cfg;
+    cfg.length = 120;
+    sweep(370000, 800, cfg, engine);
+}
+
 //--- the harness itself must be trustworthy ----------------------------------
 
 TEST_CASE("Differential harness detects a planted divergence") {

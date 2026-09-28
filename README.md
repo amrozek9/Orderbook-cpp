@@ -2,9 +2,10 @@
 
 Price-time priority matching engine. Each side of the book is a flat array of
 price levels indexed by price, with a `std::map` for prices outside it. Each
-level holds a `std::list<Order>` in arrival order, and an
-`unordered_map<OrderId, Locator>` makes cancel-by-id O(1). All of their nodes
-come from a per-book arena rather than malloc.
+level is a FIFO queue of orders threaded by 32-bit index through a pre-allocated
+pool of order slots, and an `unordered_map<OrderId, slot>` makes cancel-by-id
+O(1). The index's nodes, and the map's, come from a per-book arena rather than
+malloc.
 
 ```cpp
 lob::OrderBook book;
@@ -86,9 +87,9 @@ The window is a real bound, and these are the tradeoffs it brings:
   once, a stop-the-world pause in the middle of trading. A deployment should
   instead size the window from the instrument's known bounds: its tick size,
   its daily price bands, and the limit-up and limit-down levels.
-- **Memory is spent up front.** Each level costs 40 bytes per side, occupied or
-  not. The default of 1,024 levels is 40 KiB per side; the benchmark's 4,096 is
-  160 KiB, which competes for L2 with the orders themselves.
+- **Memory is spent up front.** Each level costs 24 bytes per side, occupied or
+  not. The default of 1,024 levels is 24 KiB per side; the benchmark's 4,096 is
+  96 KiB, which competes for L2 with the orders themselves.
 - **A thin book scans further.** The scan to a new best walks every empty slot
   between the old best and the next occupied one. That is bounded by the window
   rather than by the number of levels. An occupancy bitmap would turn it into a
@@ -107,13 +108,63 @@ checker covers the window as well:
 - empty slots hold no quantity;
 - no price inside the window is filed in the map.
 
-### Container nodes come from a per-book arena
+### Orders live in a slot pool, linked by 32-bit index
 
-Every resting order costs a list node and a hash-map node, plus a map node if it
-opens a level outside the price window, and every cancel or fill frees them. Through malloc,
-that traffic is a large share of the latency tail -- measured, not assumed; see
-[Before and after](#before-and-after-the-allocation-tail). `lob::NodeArena`
-replaces it:
+Every resting order occupies one 40-byte slot in a `SlotPool`: a single
+contiguous block, allocated and touched at construction and sized by
+`Config::expected_orders`. A slot holds the order plus two 32-bit links, and a
+price level's queue is threaded through those links: head, tail and count, 24
+bytes a level. Appending, cancelling from the middle, or filling from the front
+is a few index writes. There is no list node and no allocator call, not even
+the arena's free list. Freed slots go on an intrusive free list, LIFO, so the
+slot a cancel frees is the next one an add takes.
+
+| | `std::list` in the arena | Slot pool |
+|---|---|---|
+| Per order | 48-byte list node, anywhere in the arena's slabs | 40-byte slot, contiguous with every other order |
+| Id index entry | 24-byte locator (price, side, iterator); 48-byte node | 4-byte slot index; 32-byte node |
+| Price level | 40 bytes, so 4,096 levels take 160 KiB per side | 24 bytes, so 96 KiB per side |
+| Link | 8-byte pointer | 4-byte index |
+
+Indices rather than pointers halve every link, so more of each cache line is
+order. They also survive the block moving, which is what makes growth possible:
+
+- **Growth is a stall, not a failure.** An exhausted pool doubles and copies
+  itself once. `order_pool_growths()` counts it, and the benchmark reports it:
+  never, on its flow. Size `expected_orders` for the peak book and it never
+  happens on the matching path.
+- **`find()` pointers are short-lived.** They are valid until the next call that
+  changes the book, since a growth moves every order. The engine holds only
+  indices across calls.
+- **Memory is reserved up front,** 40 bytes a slot, whether used or not.
+- **32-bit indices cap a book** at about 4.29 billion resting orders. Past that
+  the pool throws rather than wrapping.
+
+The guide this follows says `std::list` calls `operator new` for every order.
+Here the arena had already taken the system allocator off the hot path, so what
+the pool buys is size and locality. Orders now need no allocator at all. The id
+index's hash nodes still come from the arena: one per resting order, and the
+last per-order node left. A flat, open-addressed id index would remove it.
+
+Measured against the `std::list` it replaced, the pool bought p50 (70 → 60 ns)
+and add's p99.9; p99 overall moved within noise. The
+[optimization log](#optimization-log) has the full comparison and the reasons.
+
+The pool keeps the sanitizer story intact. Under AddressSanitizer a released
+slot is poisoned until it is handed out again, so a stale index that reads it
+is reported; debug builds scribble released slots with `0xDD`. The invariant
+checker walks every queue both ways and ties each queued slot to the id index.
+It also requires the free list and the live slots to account for every slot
+ever used.
+
+### Index and map nodes come from a per-book arena
+
+Every resting order costs a hash-map node in the id index, plus a map node if it
+opens a level outside the price window, and every cancel or fill frees them.
+Before the order pool, each order cost a `std::list` node too. Through malloc,
+that traffic was a large share of the latency tail -- measured, not assumed;
+see [Before and after](#before-and-after-the-allocation-tail). `lob::NodeArena`
+replaced it:
 
 - **One arena per book,** so there is still no global state, and distinct books
   still run on distinct threads.
@@ -128,11 +179,10 @@ replaces it:
   counts every call to `operator new` during a benchmark flow to prove it, and
   runs the same flow on malloc to prove the counter works.
 
-The containers themselves are unchanged -- `std::map`, `std::list` and
-`std::unordered_map` with a stateful allocator -- so the matching logic and
-every test written against it are untouched. `Config::pool_nodes = false` puts
-the nodes back on malloc, which is how the benchmark produces both sides of its
-comparison from one binary. Under AddressSanitizer the arena is always bypassed,
+The containers take a stateful allocator and are otherwise the standard ones,
+`std::map` and `std::unordered_map`, so no logic changed to use the arena.
+`Config::pool_nodes = false` puts their nodes back on malloc, which is how the
+benchmark produces both sides of a comparison from one binary. Under AddressSanitizer the arena is always bypassed,
 so freed nodes stay poisoned and quarantined and a dangling locator is still
 caught; debug builds scribble freed blocks with `0xDD` instead.
 
@@ -162,8 +212,12 @@ operation that caused it rather than three operations later. It checks that:
 - best bid is strictly below best ask, so the book never stays crossed;
 - each level's `total_qty` equals the sum of its orders' quantities;
 - no level exists with zero orders or zero quantity;
-- the id index holds exactly one entry per resting order, and every locator
-  points at a live order with the price and side it claims;
+- each level's queue links agree in both directions, and its tail and count
+  match the orders actually in it;
+- the id index holds exactly one entry per resting order, and each entry names
+  the slot where that order is queued;
+- the order pool's free list is acyclic, and together with the live slots it
+  accounts for every slot ever handed out;
 - every resting order has quantity greater than zero.
 
 Level aggregates are 64-bit (`lob::Volume`) while a single order's quantity is
@@ -212,7 +266,9 @@ actually exercise matching:
   so the flat array must be invisible. Windows are placed narrower than the
   band, centred on a varying first price, one level wide, absent, entirely
   missing the band, and pressed against the top of the price range. Levels open
-  on both sides of the window's edges, and the best price keeps crossing them.
+  on both sides of the window's edges, and the best price keeps crossing them;
+- an order pool that starts at one slot, so it grows, and moves every order,
+  over and over while the sequence runs.
 
 On a 40-operation sequence that yields about 12 trades, and every sequence
 produces at least one.
@@ -243,7 +299,11 @@ taker used to report `remaining == 0`, indistinguishable from a complete fill.
 
 The price window was checked the same way, with two planted bugs: a best-price
 lookup that ignores the fallback map, and a best-first walk that lists outside
-levels in the wrong place. Both shrink to two or three operations.
+levels in the wrong place. Both shrink to two or three operations. The order
+pool was checked with two more: a removal that leaves the next order's back link
+stale, and a release that leaks the slot instead of freeing it. Both abort at the
+first invariant check in debug builds; in release, the leak fails five test
+cases, and the stale link sends the match loop round a cycle.
 
 For longer campaigns:
 
@@ -264,11 +324,14 @@ option is applied before Catch2 is fetched, so the test framework is
 instrumented too.
 
 **AddressSanitizer + UndefinedBehaviorSanitizer.** The full suite and the fuzzer
-run clean. This matters here because the engine hands out `std::list` iterators
-as locators and erases list nodes during matching -- exactly the shape of code
-that produces use-after-free. The node arena is bypassed in this build, so every
-node goes through ASan's own allocator, poisoned and quarantined when freed; the
-one test that needs the arena, the zero-allocation check, is skipped here.
+run clean. This matters here because the engine keeps slot indices into its
+order pool and releases slots during matching -- exactly the shape of code that
+produces use-after-free. Two things keep ASan able to see it. The node arena is
+bypassed in this build, so every index and map node goes through ASan's own
+allocator, poisoned and quarantined when freed. The order pool cannot be
+bypassed that way, so it poisons each released slot until it is handed out
+again. The one test that needs the arena, the zero-allocation check, is skipped
+here.
 
 ```sh
 cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug -DLOB_SANITIZER=address
@@ -312,8 +375,9 @@ cmake --build build-rel -j
 Options: `--ops`, `--warmup`, `--runs`, `--seed`, `--depth`, `--cpu` or
 `--no-pin`, `--prefault`, `--system-alloc`, `--price-levels`, and `--dump`,
 which writes every sample -- engine and noise floor -- as `run,index,kind,ns`.
-`--system-alloc` and `--price-levels 0` switch off the node arena and the flat
-price array, so one binary can measure either change against its absence.
+`--system-alloc` puts the index and map nodes back on malloc, and
+`--price-levels 0` switches off the flat price array, so one binary can measure
+either against its absence. Orders always live in the slot pool.
 
 `tools/plot_latency.py` turns dumps into the two figures below. It needs only
 Python 3:
@@ -381,7 +445,7 @@ the output shows it worked.
 | Warm up | Each run replays 300,000 mixed operations (`--warmup`) through the same never-inlined timing loop before recording, so the branch predictor is trained on the exact code that is then timed | The header states the warm-up each run gets |
 | Pin to a core | `pthread_setaffinity_np` to `--cpu`, or else the last CPU allowed, since CPU 0 tends to take the most interrupts | The header names the CPU; it is re-checked after every run, and a run found elsewhere is flagged |
 | Fix the clock frequency | Reads the cpufreq governor and boost setting; warns unless the governor is `performance` and boost is off. Calibration spins for 200 ms right before the first run, so the core is at full speed | Printed in the header |
-| Pre-fault memory | Flow and sample buffers are written before timing. The book is provisioned for twice the target depth, so its arena's slabs are allocated and touched at construction. On glibc the heap is also grown by 64 MiB (`--prefault`), every page touched, and trimming turned off, for anything still on malloc | Page faults during each timed pass are counted: 0 in every run |
+| Pre-fault memory | Flow and sample buffers are written before timing. The book is provisioned for twice the target depth, so its order pool and its arena's slabs are allocated and touched at construction. On glibc the heap is also grown by 64 MiB (`--prefault`), every page touched, and trimming turned off, for anything still on malloc | Page faults during each timed pass are counted: 0 in every run |
 | `rdtscp`, not `std::chrono` | Each sample brackets one engine call between `lfence; rdtsc; lfence` and `rdtscp; lfence`, and is stored in ticks. Conversion to nanoseconds happens once, in the report | The header prints the TSC rate and resolution |
 | Subtract timer overhead | The median cost of an empty bracket, 96 ticks (30 ns) here, is subtracted from every sample | Printed in the header |
 | Repeat and report variance | 5 runs (`--runs`), each on a fresh book. The report gives the median of every percentile across runs, and each cell's spread | The spread table |
@@ -436,53 +500,54 @@ flags. A `git worktree` with its own release tree does it.
 ### Results
 
 Ryzen 7 7735HS under WSL2, GCC 15 `-O3`, 5 runs of 2M operations over a book of
-about 5,000 orders, on the node arena and the flat price array:
+about 5,000 orders, on the order pool, the node arena and the flat price array:
 
 ```
 runs (ns over all timed ops; page faults and context switches while timing)
-  run 1  p50 70  p99 271  p99.9 761  p99.99 14,488  max 295,359   faults 0  switches 1
-  run 2  p50 70  p99 291  p99.9 761  p99.99 13,726  max 10,959,399   faults 0  switches 0
-  run 3  p50 70  p99 240  p99.9 571  p99.99 13,606  max 652,769   faults 0  switches 1
-  run 4  p50 70  p99 260  p99.9 641  p99.99 13,476  max 907,861   faults 0  switches 0
-  run 5  p50 70  p99 260  p99.9 681  p99.99 14,097  max 260,675   faults 0  switches 1
+  run 1  p50 70  p99 291  p99.9 761  p99.99 18,616  max 2,132,806   faults 0  switches 0
+  run 2  p50 70  p99 281  p99.9 711  p99.99 18,736  max 290,580   faults 0  switches 0
+  run 3  p50 60  p99 281  p99.9 751  p99.99 13,396  max 160,138   faults 0  switches 1
+  run 4  p50 70  p99 291  p99.9 751  p99.99 19,888  max 858,463   faults 0  switches 0
+  run 5  p50 70  p99 281  p99.9 701  p99.99 18,586  max 1,661,059   faults 0  switches 0
+  orders       pool never outgrew its 10,000 slots
   prices       flat array of 4,096 levels from 97,957; 0 levels opened outside it
 
 latency (ns), median of 5 runs
                     count      p50      p99    p99.9   p99.99        max
-  all           2,000,000       70      260      681   13,726    652,769
-  add             999,655       80      170      541   16,562    652,769
-  cancel          799,831       40      130      391    2,124    110,722
-  modify          100,354      110      250      882   20,579     63,754
-  marketable      100,160      120      621    1,493   20,670     85,093
-  (spin)        2,000,000      100      110      180   14,327    716,509
+  all           2,000,000       70      281      751   18,616    858,463
+  add             999,655       70      180      561   18,135    290,580
+  cancel          799,831       40      150      421   13,466    377,086
+  modify          100,354      110      271      822   22,293     94,983
+  marketable      100,160      130      701    1,773   24,688    107,156
+  (spin)        2,000,000      100      110      190   15,179    575,408
 
 spread across runs, (max - min) / median
                                 p50      p99    p99.9   p99.99        max
-  all                           0%      19%      28%       7%      1639%
-  add                           0%      24%      41%      11%       470%
-  cancel                        0%      23%     108%      27%       468%
-  modify                        0%      24%      58%      19%     17151%
-  marketable                    8%      15%      50%      24%       231%
-  (spin)                        0%       0%      67%      27%       327%
+  all                          14%       4%       8%      35%       230%
+  add                           0%       6%      12%      37%       259%
+  cancel                       25%      13%      33%     101%       530%
+  modify                        0%       4%      20%      36%       731%
+  marketable                    8%       6%      24%      46%       239%
+  (spin)                       30%       9%      47%      29%      1315%
 ```
 
-**p50 through p99.9 are the engine.** The spin row stays at 100-180 ns there,
+**p50 through p99.9 are the engine.** The spin row stays at 100-190 ns there,
 while the operations are several times that.
 
 **p99.99 and max are the machine.** Spinning for 100 ns with no engine involved
-still reaches 14 µs at p99.99, the same range as almost every operation type. A
+still reaches 15 µs at p99.99, the same range as every operation type. A
 standalone check agrees: the count of multi-microsecond spikes grows in
 proportion to the length of the timed window, which is the signature of
 interrupts rather than of anything the code does.
 
-The exception proves the rule. Cancels became short enough that interrupts now
-land in fewer than 0.01% of them. Cancel's p99.99 has therefore dropped below
-the machine's floor to 2 µs, which is its own tail again. It is a threshold
-effect rather than a speedup of the same size, and it is not claimed as one.
+Cancel sits right on the threshold. It is short enough that interrupts land in
+roughly 0.01% of cancels, so cancel's p99.99 swings from session to session. It
+has come in near 2 µs, below the machine's floor, and at the floor itself, 13
+µs here. Neither value is a result.
 
-**What a result has to beat.** Spreads are wide in this session: overall p99
-moves by 19% between runs and per-type p99.9 by up to 108%, each widened by a
-single disturbed run. Read against this table alone, a change is real only when
+**What a result has to beat.** In this session overall p99 moves by 4% between
+runs and per-type p99.9 by up to 33%; in the last session, 19% and 108%. A
+single disturbed run widens either. Read against this table alone, a change is real only when
 it exceeds the spread of the cell it claims to improve, so a 3% gain in cancel
 p99.9 is noise here. Comparing two versions is a different question, answered
 better by `tools/ab_compare.py`, described above.
@@ -512,6 +577,7 @@ type. Only cells the sign test marks count.
 |---|---|---|---|---|
 | Node arena instead of malloc | 100 → 80 | 451 → 321 (−29%) | 1,132 → 812 (−28%) | Every type. Marketable p99 −33%, add −34% |
 | Flat price array instead of `std::map` | 80 → 70 | 301 → 271 (−10%) | 711 → 651, not significant | p99 and p99.9: cancel −33% and −34%, modify −31% and −30%, add −22% and −18%. Marketable unchanged |
+| Order slot pool with 32-bit links instead of `std::list` | 70 → 60 | 261 → 250, not significant | 681 → 641, not significant | add p50 −12% and p99.9 −10%; nothing else significant |
 
 Each row is its own paired measurement, so a row's "before" need not equal the
 previous row's "after". The machine drifts between sessions, which is why a
@@ -532,6 +598,32 @@ used to find its level by walking the tree, and now reaches it with a
 subtraction and a load. An add found its level the same way. A marketable order
 spends its time erasing orders and emitting trades, which the array does not
 touch.
+
+The order pool's comparison is the other kind of result, and just as worth
+recording:
+
+```
+                                    p50                         p99                       p99.9
+all              70 ->    60  -14%  9/11*     261 ->   250   -4%  7/11      681 ->   641   -6%  7/11 
+add              80 ->    70  -12% 11/11*     170 ->   160   -6%  7/11*     511 ->   461  -10%  9/11*
+cancel           40 ->    40   +0%  0/11      140 ->   130   -7%  9/11      331 ->   311   -6%  7/11 
+modify          110 ->   100   -9%  7/11*     240 ->   230   -4%  8/11      681 ->   661   -3%  7/11 
+marketable      130 ->   130   +0%  3/11      641 ->   641   +0%  6/11    1,543 -> 1,503   -3%  7/11 
+```
+
+It bought p50, and add's p99.9, and little else. The arena had already taken
+the system allocator off the hot path, so the pool's gains are size and
+locality. A 5,000-order book mostly fits in cache either way. On a
+200,000-order book, 9 pairs gave the same shape:
+
+- **Add improved**, −12% at p50 and at p99.
+- **Cancel's p50 moved up one clock step**, 40 → 50 ns, winning no pair.
+- **Nothing else moved significantly.**
+
+One explanation for the cancel step was that a cancel now waits for the slot to
+load before it can find the level, where the old locator carried price and
+side. Storing price and side beside the slot index took that load off the path,
+at no memory cost, and changed nothing. So the index stays slot-only.
 
 ### Before and after: the allocation tail
 
@@ -563,13 +655,13 @@ run-to-run spread are counted as results:
 | modify | 190 → 160 | 431 → 371 (−14%) | 902 → 681, within noise (53% spread) |
 | marketable | 160 → 130 | 1,002 → 661 (−34%) | 2,034 → 1,212, within noise (42% spread) |
 
-The allocator was not the whole tail, and neither was the price map. At
-`--depth 200000`, where the working set outgrows the caches, the flat array
-still wins p50 and trims p99 from 982 to 912 ns. The tail stays near 1 µs,
-though. What remains there is per order: a `std::list` node for every order and
-a hash-bucket chain for every id, scattered across the heap. Intrusive order
-lists and a flat id index are the next targets, and this benchmark is how to
-tell whether they work.
+The allocator was not the whole tail, and neither was the price map or the list
+nodes. At `--depth 200000`, where the working set outgrows the caches, the flat
+array trimmed p99 from 982 to 912 ns and the order pool left it there. The
+tail stays near 1 µs. Every operation still makes two dependent hops through
+the id index: bucket array to node, then node to slot. A flat, open-addressed
+id index is the next target, and this benchmark is how to tell whether it
+works.
 
 ## Build
 
