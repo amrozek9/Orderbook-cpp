@@ -347,6 +347,33 @@ with no engine involved. Interrupts and hypervisor exits land in a window in
 proportion to its length, so that row is the machine's own contribution at each
 percentile.
 
+### Comparing two versions
+
+The spread table answers "how noisy is one configuration?" An optimization asks
+something else: is B faster than A? Comparing two separate five-run reports
+answers that badly on a noisy machine, because one disturbed run widens a
+max-minus-min spread enough to hide a real 30% gain.
+
+`tools/ab_compare.py` asks the question directly:
+
+- It runs the two builds alternately, one run each per pair, so drift in the
+  machine lands on both sides equally.
+- It checks that every run timed the same flow.
+- For each cell it reports the median across pairs and how many pairs the
+  change won.
+
+If the change did nothing, each pair is a coin flip. A sign test turns the win
+count into the chance of a result at least that lopsided, and a cell is marked
+only when that chance is under 5%. At 11 pairs, that takes 10 wins.
+
+```sh
+python3 tools/ab_compare.py --pairs 11 ../old/build-rel/bench build-rel/bench
+python3 tools/ab_compare.py "build-rel/bench --system-alloc" build-rel/bench
+```
+
+Build the old side from the commit before the change, with the same compiler
+flags. A `git worktree` with its own release tree does it.
+
 ### Results
 
 Ryzen 7 7735HS under WSL2, GCC 15 `-O3`, 5 runs of 2M operations over a book of
@@ -391,7 +418,8 @@ interrupts rather than of anything the code does.
 **What a result has to beat.** Overall p99 is stable to 7%, but per-type p99.9
 moves by up to 53% between runs. A change to the engine is real only when it
 exceeds the spread of the cell it claims to improve. For example, a 3% gain in
-cancel p99.9 is noise here.
+cancel p99.9 is noise here. To compare two versions, use `tools/ab_compare.py`,
+described above.
 
 WSL2 has no cpufreq interface -- the Windows host owns the clock -- so the
 governor cannot be fixed from inside it. For tails worth quoting, use bare-metal
