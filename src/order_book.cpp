@@ -79,7 +79,7 @@ void PriceLadder<IsBid>::check() const {
         const PriceLevel& level = window[i];
         if (level.empty()) {
             assert(level.total_qty == 0 && "empty array slot still holds quantity");
-            assert(level.count == 0 && level.tail == kNoSlot && "empty array slot still holds orders");
+            assert(level.tail == kNoSlot && "empty array slot still holds orders");
             continue;
         }
         assert(i < limit && "occupied slot beyond the placed window");
@@ -217,7 +217,6 @@ void OrderBook::append(PriceLevel& level, SlotIndex slot) {
     if (level.tail != kNoSlot) pool[level.tail].next = slot;
     else                       level.head = slot;
     level.tail = slot;
-    ++level.count;
     level.total_qty += s.value.qty;
 }
 
@@ -227,7 +226,6 @@ void OrderBook::detach(PriceLevel& level, SlotIndex slot) {
     else                   level.head = s.next;
     if (s.next != kNoSlot) pool[s.next].prev = s.prev;
     else                   level.tail = s.prev;
-    --level.count;
     level.total_qty -= s.value.qty;
     pool.release(slot);
 }
@@ -340,7 +338,10 @@ Volume OrderBook::qty_at(Side side, Price price) const {
 
 std::size_t OrderBook::order_count_at(Side side, Price price) const {
     const PriceLevel* level = side == Side::Buy ? bids.find(price) : asks.find(price);
-    return level ? level->count : 0;
+    if (!level) return 0;
+    std::size_t n = 0;                  //Not stored: a query, not the matching path
+    for (SlotIndex i = level->head; i != kNoSlot; i = pool[i].next) ++n;
+    return n;
 }
 
 std::optional<Order> OrderBook::find(OrderId id) const {
@@ -378,7 +379,6 @@ void OrderBook::check_side(const BookSide& book, Side side, std::size_t& counted
             assert(side_of(*indexed) == side && "index files the order on the wrong side");
         }
         assert(prev == level.tail && "level's tail is not its last order");
-        assert(in_queue == level.count && "level's count != orders in its queue");
         assert(sum == level.total_qty && "level total != sum of its orders");
         assert(level.total_qty > 0 && "level exists with zero quantity");
         counted += in_queue;

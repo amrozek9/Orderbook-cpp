@@ -87,9 +87,10 @@ The window is a real bound, and these are the tradeoffs it brings:
   once, a stop-the-world pause in the middle of trading. A deployment should
   instead size the window from the instrument's known bounds: its tick size,
   its daily price bands, and the limit-up and limit-down levels.
-- **Memory is spent up front.** Each level costs 24 bytes per side, occupied or
-  not. The default of 1,024 levels is 24 KiB per side; the benchmark's 4,096 is
-  96 KiB, which competes for L2 with the orders themselves.
+- **Memory is spent up front.** Each level costs 16 bytes per side, occupied or
+  not: total quantity plus head and tail indices, four levels to a cache line.
+  The default of 1,024 levels is 16 KiB per side; the benchmark's 4,096 is 64
+  KiB.
 - **A thin book scans further.** The scan to a new best walks every empty slot
   between the old best and the next occupied one. That is bounded by the window
   rather than by the number of levels. An occupancy bitmap would turn it into a
@@ -113,8 +114,8 @@ checker covers the window as well:
 Every resting order occupies one 32-byte slot in a `SlotPool`: a single
 contiguous block, allocated and touched at construction and sized by
 `Config::expected_orders`. A slot holds the order's hot fields plus two 32-bit
-links, and a price level's queue is threaded through those links: head, tail and count, 24
-bytes a level. Appending, cancelling from the middle, or filling from the front
+links, and a price level's queue is threaded through those links. A level holds
+only its total quantity and the head and tail indices, 16 bytes. Appending, cancelling from the middle, or filling from the front
 is a few index writes. There is no list node and no allocator call, not even
 the arena's free list. Freed slots go on an intrusive free list, LIFO, so the
 slot a cancel frees is the next one an add takes.
@@ -123,7 +124,7 @@ slot a cancel frees is the next one an add takes.
 |---|---|---|
 | Per order | 48-byte list node, anywhere in the arena's slabs | 32-byte slot, two to a cache line (40 bytes before the hot/cold split below) |
 | Id index entry | 24-byte locator (price, side, iterator); 48-byte node | 4-byte slot index; 32-byte node, and now a 16-byte entry in the flat index |
-| Price level | 40 bytes, so 4,096 levels take 160 KiB per side | 24 bytes, so 96 KiB per side |
+| Price level | 40 bytes, so 4,096 levels take 160 KiB per side | 16 bytes, so 64 KiB per side (24 before the order count went) |
 | Link | 8-byte pointer | 4-byte index |
 
 Indices rather than pointers halve every link, so more of each cache line is
@@ -285,8 +286,8 @@ operation that caused it rather than three operations later. It checks that:
 - best bid is strictly below best ask, so the book never stays crossed;
 - each level's `total_qty` equals the sum of its orders' quantities;
 - no level exists with zero orders or zero quantity;
-- each level's queue links agree in both directions, and its tail and count
-  match the orders actually in it;
+- each level's queue links agree in both directions, and its tail is the last
+  order in it;
 - the id index holds exactly one entry per resting order, each entry names the
   slot where that order is queued and the side it rests on, and every entry can
   be reached by probing from its home slot;
@@ -588,50 +589,51 @@ about 5,000 orders, on the order pool, the flat id index and the flat price arra
 
 ```
 runs (ns over all timed ops; page faults and context switches while timing)
-  run 1  p50 50  p99 210  p99.9 571  p99.99 13,494  max 459,023   faults 0  switches 0
-  run 2  p50 50  p99 190  p99.9 541  p99.99 2,014  max 405,921   faults 0  switches 1
-  run 3  p50 50  p99 210  p99.9 581  p99.99 7,744  max 696,402   faults 0  switches 0
-  run 4  p50 50  p99 210  p99.9 531  p99.99 12,232  max 222,809   faults 0  switches 0
-  run 5  p50 50  p99 200  p99.9 591  p99.99 2,595  max 304,142   faults 0  switches 1
+  run 1  p50 50  p99 230  p99.9 491  p99.99 21,201  max 492,311   faults 0  switches 1
+  run 2  p50 50  p99 210  p99.9 431  p99.99 12,344  max 173,817   faults 0  switches 0
+  run 3  p50 50  p99 261  p99.9 551  p99.99 22,955  max 453,870   faults 0  switches 0
+  run 4  p50 50  p99 200  p99.9 421  p99.99 13,196  max 714,385   faults 0  switches 0
+  run 5  p50 50  p99 220  p99.9 471  p99.99 17,704  max 283,781   faults 0  switches 1
   orders       pool and id index never outgrew 10,000 orders
   prices       flat array of 4,096 levels from 97,957; 0 levels opened outside it
 
 latency (ns), median of 5 runs
                     count      p50      p99    p99.9   p99.99        max
-  all           2,000,000       50      210      571    7,744    405,921
-  add             999,655       50      140      401    1,994    136,992
-  cancel          799,831       40      140      551    1,803    304,142
-  modify          100,354       90      270      862   18,603    132,117
-  marketable      100,160       90      461    1,172   21,288     89,971
-  (spin)        2,000,000       70       90      120   12,502    193,266
+  all           2,000,000       50      220      471   17,704    453,870
+  add             999,655       50      130      331   17,173    175,574
+  cancel          799,831       40      170      381   12,975    283,781
+  modify          100,354       90      281      511   24,868    105,344
+  marketable      100,160      100      491      892   28,415    257,389
+  (spin)        2,000,000       70       90      200   16,161  1,233,365
 
 spread across runs, (max - min) / median
                                 p50      p99    p99.9   p99.99        max
-  all                           0%      10%      11%     148%       117%
-  add                           0%      14%      15%     587%       257%
-  cancel                        0%      21%      22%     167%       175%
-  modify                        0%      11%      22%      44%       119%
-  marketable                   11%       9%      15%      21%        54%
-  (spin)                        0%      22%      67%     114%       390%
+  all                           0%      27%      28%      60%       119%
+  add                           0%      23%      21%     123%       160%
+  cancel                       25%      41%      37%     150%       219%
+  modify                       11%      25%      22%      33%       156%
+  marketable                   20%      33%      36%      66%        89%
+  (spin)                        0%      22%      60%      36%       160%
 ```
 
-**p50 through p99.9 are the engine.** The spin row stays at 70-120 ns there,
+**p50 through p99.9 are the engine.** The spin row stays at 70-200 ns there,
 while the operations are several times that.
 
 **p99.99 and max are the machine.** Spinning for 70 ns with no engine involved
-still reaches 12 µs at p99.99. Modify and marketable sit in the same range. A
+still reaches 16 µs at p99.99, the same range as every operation type in this
+run. A
 standalone check agrees: the count of multi-microsecond spikes grows in
 proportion to the length of the timed window, which is the signature of
 interrupts rather than of anything the code does.
 
-Add and cancel now sit right on the threshold. They are short enough that
+Add and cancel sit right on the threshold. They are short enough that
 interrupts land in roughly 0.01% of them, so their p99.99 swings from session to
-session. It comes in near 2 µs, below the machine's floor, as both did here, or
-at the floor itself, above 10 µs. Neither value is a result, and the overall
-p99.99 inherits the swing.
+session. It comes in near 2 µs, below the machine's floor, in some sessions, and
+at the floor itself, above 10 µs, in others, this one included. Neither value is
+a result, and the overall p99.99 inherits the swing.
 
-**What a result has to beat.** In this session overall p99 moves by 10% between
-runs and per-type p99.9 by up to 22%. Other sessions have ranged from 4% to 108%. A
+**What a result has to beat.** In this session overall p99 moves by 27% between
+runs and per-type p99.9 by up to 37%. Other sessions have ranged from 4% to 108%. A
 single disturbed run widens either. Read against this table alone, a change is real only when
 it exceeds the spread of the cell it claims to improve, so a 3% gain in cancel
 p99.9 is noise here. Comparing two versions is a different question, answered
@@ -665,6 +667,7 @@ operation type. Only cells the sign test marks count.
 | Order slot pool with 32-bit links instead of `std::list` | 70 → 60 | 261 → 250, not significant | 681 → 641, not significant | add p50 −12% and p99.9 −10%; nothing else significant |
 | Flat id index instead of `std::unordered_map` (15 pairs) | 70 → 50 | 311 → 240 (−23%) | 832 → 581 (−30%) | add and marketable about −30% at p99 and p99.9; cancel within noise. On a 200,000-order book: p99 992 → 561 (−43%), p99.9 2,735 → 1,182 (−57%) |
 | 32-byte hot order slot instead of 40 (15 pairs) | 50 → 50 | 210 → 210, not significant | 611 → 561, not significant | cancel p50 50 → 40; nothing else significant, and no change on a 200,000-order book |
+| 16-byte price levels instead of 24 (15 pairs) | 50 → 50 | 190 → 190, not significant | 401 → 401, not significant | nothing significant at either depth |
 
 Each row is its own paired measurement, so a row's "before" need not equal the
 previous row's "after". The machine drifts between sessions, which is why a
@@ -772,6 +775,12 @@ The layout is kept anyway: it is smaller, never straddles a line, and building
 it exposed the `alignas` trap described above, which would have quietly
 undermined any later layout work.
 
+Dense 16-byte price levels measured nothing either, at both depths. The
+benchmark's 4,096-level window fits in L2 at either size (96 KiB against 64
+KiB), and a sweep or a scan for the next best price touches a few adjacent
+levels either way. Dropping the stored order count took nothing from the
+matching path, since only `order_count_at()` read it.
+
 ### Before and after: the allocation tail
 
 The same binary, the same flow and the same seed, with container nodes on malloc
@@ -806,9 +815,13 @@ The allocator was not the whole tail, and neither was the price map or the list
 nodes. At `--depth 200000`, where the working set outgrows the caches, the flat
 array trimmed p99 from 982 to 912 ns, and the order pool left it there. The
 flat id index finally moved it, to 561 ns, by removing the chained table's two
-dependent hops per lookup. What remains is layout: a 40-byte order slot where
-32 bytes would do, and 24-byte price levels where 16 would. Those are the next
-passes, and this benchmark is how to tell whether they work.
+dependent hops per lookup. The layout passes after it -- a 32-byte order slot,
+16-byte price levels -- made each structure smaller and left the tail where it
+was. On the deep book a cancel still makes three dependent accesses: its index
+entry, its order slot and its price level, each likely a miss once the book
+outgrows the caches. Smaller structures do not make those accesses fewer.
+Changes that would are the next lever, and this benchmark is how to tell
+whether they work.
 
 ## Build
 

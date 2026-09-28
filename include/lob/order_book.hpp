@@ -88,15 +88,17 @@ namespace lob {
 
     //The resting orders at one price, as a FIFO queue threaded through the
     //book's order pool by slot index: head has time priority, and each slot
-    //holds its neighbours' indices. 24 bytes, so a flat array of levels packs
-    //two and a half to a cache line.
+    //holds its neighbours' indices. Total quantity and the two ends, nothing
+    //else: 16 bytes, four to a cache line, so a sweep or a scan for the next
+    //best price walks the array linearly and the prefetcher keeps up. The
+    //order count is not stored; order_count_at() walks the queue instead.
     struct PriceLevel {
         Volume total_qty = 0;
         SlotIndex head = kNoSlot;   //Oldest
         SlotIndex tail = kNoSlot;   //Newest
-        std::uint32_t count = 0;    //Orders in the queue
         bool empty() const {return head == kNoSlot;}
     };
+    static_assert(sizeof(PriceLevel) == 16, "a price level must stay four to a cache line");
 
     //One side of the book.
     //
@@ -314,7 +316,7 @@ namespace lob {
         std::size_t expected_orders = 0;
         //Consecutive prices, in ticks, whose levels live in each side's flat
         //array. Prices outside fall back to a std::map: correct, but slower.
-        //Each level costs 24 bytes per side, allocated at construction. 0 puts
+        //Each level costs 16 bytes per side, allocated at construction. 0 puts
         //every level in the map.
         std::size_t price_levels = 1024;
         //The window's lowest price. Unset, the window is centred on the first
