@@ -18,8 +18,8 @@ std::array<std::uint64_t, 4> row(std::uint64_t side, Price price,
 
 }
 
-Observed run_engine(const Sequence& ops, SelfTradePolicy policy) {
-    lob::OrderBook book(lob::Config{policy, 1u << 16});
+Observed run_engine(const Sequence& ops, const lob::Config& cfg) {
+    lob::OrderBook book(cfg);
     Observed obs;
 
     for (const Op& op : ops) {
@@ -84,7 +84,7 @@ Observed run_reference(const Sequence& ops, SelfTradePolicy policy) {
     return obs;
 }
 
-Sequence shrink(Sequence failing, SelfTradePolicy policy) {
+Sequence shrink(Sequence failing, const lob::Config& cfg) {
     bool progress = true;
     while (progress && failing.size() > 1) {
         progress = false;
@@ -98,7 +98,7 @@ Sequence shrink(Sequence failing, SelfTradePolicy policy) {
                 candidate.insert(candidate.end(),
                                  failing.begin() + static_cast<std::ptrdiff_t>(i + chunk),
                                  failing.end());
-                if (!candidate.empty() && diverges(candidate, policy)) {
+                if (!candidate.empty() && diverges(candidate, cfg)) {
                     failing = std::move(candidate);
                     progress = true;
                 } else {
@@ -111,13 +111,18 @@ Sequence shrink(Sequence failing, SelfTradePolicy policy) {
     return failing;
 }
 
-std::string format(const Sequence& ops, SelfTradePolicy policy) {
+std::string format(const Sequence& ops, const lob::Config& cfg) {
+    const SelfTradePolicy policy = cfg.self_trade;
     const char* pol = policy == SelfTradePolicy::Allow          ? "Allow"
                     : policy == SelfTradePolicy::CancelIncoming ? "CancelIncoming"
                                                                 : "CancelResting";
     std::ostringstream o;
     o << "\n// SelfTradePolicy::" << pol << ", " << ops.size() << " ops\n";
-    o << "lob::OrderBook book(lob::Config{lob::SelfTradePolicy::" << pol << ", 4096});\n";
+    o << "lob::Config cfg{lob::SelfTradePolicy::" << pol << ", 4096};\n";
+    if (cfg.price_levels != lob::Config{}.price_levels)
+        o << "cfg.price_levels = " << cfg.price_levels << ";\n";
+    if (cfg.price_base) o << "cfg.price_base = " << *cfg.price_base << "u;\n";
+    o << "lob::OrderBook book(cfg);\n";
     for (const Op& op : ops) {
         const char* side = op.side == Side::Buy ? "Side::Buy" : "Side::Sell";
         switch (op.kind) {

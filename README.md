@@ -1,9 +1,10 @@
 # lob — a limit order book
 
-Price-time priority matching engine. Bids and asks are `std::map` keyed by price
-with opposite comparators, each price level holds a `std::list<Order>` in arrival
-order, and an `unordered_map<OrderId, Locator>` makes cancel-by-id O(1). All
-of their nodes come from a per-book arena rather than malloc.
+Price-time priority matching engine. Each side of the book is a flat array of
+price levels indexed by price, with a `std::map` for prices outside it. Each
+level holds a `std::list<Order>` in arrival order, and an
+`unordered_map<OrderId, Locator>` makes cancel-by-id O(1). All of their nodes
+come from a per-book arena rather than malloc.
 
 ```cpp
 lob::OrderBook book;
@@ -60,10 +61,56 @@ count means the caller undersized the ring or is draining too rarely, not that
 the book mismatched. Matching itself is unaffected: `ExecReport::filled` and the
 book state stay correct regardless.
 
+### Price levels live in a flat array
+
+Each side of the book is a `PriceLadder`: an array of price levels covering a
+window of consecutive prices, indexed by `price - base`. A `std::map` is a
+red-black tree, and every lookup in it is a chain of dependent loads through
+nodes scattered across the heap. The array replaces that with:
+
+- **One subtraction and one load** to reach any level, with neighbouring levels
+  in adjacent cache lines.
+- **Top of book as a field read.** The best level is tracked as an index. When
+  it empties, the ladder scans outward to the next occupied price, which in a
+  live market is a tick or two away.
+
+The window is a real bound, and these are the tradeoffs it brings:
+
+- **Prices outside the window fall back to a `std::map`.** They trade correctly
+  and appear in book order, but pay the tree's cost.
+  `levels_opened_outside_window()` counts every level that took that path, and
+  the benchmark reports it: 0 on its flow.
+- **The window never moves.** It is centred on the first price that rests, or
+  pinned with `Config::price_base`. A market that trends out of it keeps
+  working at map speed. Re-centring would mean moving every resting level at
+  once, a stop-the-world pause in the middle of trading. A deployment should
+  instead size the window from the instrument's known bounds: its tick size,
+  its daily price bands, and the limit-up and limit-down levels.
+- **Memory is spent up front.** Each level costs 40 bytes per side, occupied or
+  not. The default of 1,024 levels is 40 KiB per side; the benchmark's 4,096 is
+  160 KiB, which competes for L2 with the orders themselves.
+- **A thin book scans further.** The scan to a new best walks every empty slot
+  between the old best and the next occupied one. That is bounded by the window
+  rather than by the number of levels. An occupancy bitmap would turn it into a
+  handful of word scans, but on this flow the next level is almost always
+  adjacent.
+- **Prices are ticks.** The engine indexes by `price - base` with a tick size
+  of 1. A feed with decimal prices converts on the way in, as
+  `(price - base_price) / tick_size`, before the order reaches the book.
+
+`Config::price_levels = 0` puts every level in the map, which is how the same
+binary measures the difference (`bench --price-levels 0`). The invariant
+checker covers the window as well:
+
+- the occupied count matches the array;
+- the best index is the best occupied level;
+- empty slots hold no quantity;
+- no price inside the window is filed in the map.
+
 ### Container nodes come from a per-book arena
 
-Every resting order costs a list node and a hash-map node, plus a map node when
-it opens a price level, and every cancel or fill frees them. Through malloc,
+Every resting order costs a list node and a hash-map node, plus a map node if it
+opens a level outside the price window, and every cancel or fill frees them. Through malloc,
 that traffic is a large share of the latency tail -- measured, not assumed; see
 [Before and after](#before-and-after-the-allocation-tail). `lob::NodeArena`
 replaces it:
@@ -160,7 +207,12 @@ actually exercise matching:
   fires constantly;
 - cancels and modifies weighted toward recently touched ids, which are the ones
   most likely to have just been filled, exercising cancel-of-dead-id and index
-  cleanup; plus occasional never-issued ids and duplicate live ids.
+  cleanup; plus occasional never-issued ids and duplicate live ids;
+- price windows of every shape against that band. The reference has no window,
+  so the flat array must be invisible. Windows are placed narrower than the
+  band, centred on a varying first price, one level wide, absent, entirely
+  missing the band, and pressed against the top of the price range. Levels open
+  on both sides of the window's edges, and the best price keeps crossing them.
 
 On a 40-operation sequence that yields about 12 trades, and every sequence
 produces at least one.
@@ -189,6 +241,10 @@ crossed-book invariant in debug builds and the differential comparison in
 release. Chasing that third one is also what surfaced a real flaw -- a halted
 taker used to report `remaining == 0`, indistinguishable from a complete fill.
 
+The price window was checked the same way, with two planted bugs: a best-price
+lookup that ignores the fallback map, and a best-first walk that lists outside
+levels in the wrong place. Both shrink to two or three operations.
+
 For longer campaigns:
 
 ```sh
@@ -197,7 +253,8 @@ For longer campaigns:
 ```
 
 It is deterministic: a seed always reproduces the same sequence, and it exits
-non-zero on the first divergence.
+non-zero on the first divergence. It rotates the self-trade policy and the price
+window's shape by seed, so a long campaign covers every combination.
 
 ### Sanitizers
 
@@ -253,8 +310,10 @@ cmake --build build-rel -j
 ```
 
 Options: `--ops`, `--warmup`, `--runs`, `--seed`, `--depth`, `--cpu` or
-`--no-pin`, `--prefault`, `--system-alloc`, and `--dump`, which writes every
-sample -- engine and noise floor -- as `run,index,kind,ns`.
+`--no-pin`, `--prefault`, `--system-alloc`, `--price-levels`, and `--dump`,
+which writes every sample -- engine and noise floor -- as `run,index,kind,ns`.
+`--system-alloc` and `--price-levels 0` switch off the node arena and the flat
+price array, so one binary can measure either change against its absence.
 
 `tools/plot_latency.py` turns dumps into the two figures below. It needs only
 Python 3:
@@ -377,49 +436,56 @@ flags. A `git worktree` with its own release tree does it.
 ### Results
 
 Ryzen 7 7735HS under WSL2, GCC 15 `-O3`, 5 runs of 2M operations over a book of
-about 5,000 orders, on the node arena:
+about 5,000 orders, on the node arena and the flat price array:
 
 ```
 runs (ns over all timed ops; page faults and context switches while timing)
-  run 1  p50 90  p99 301  p99.9 621  p99.99 20,600  max 1,284,940   faults 0  switches 0
-  run 2  p50 80  p99 301  p99.9 661  p99.99 19,638  max 812,075   faults 0  switches 0
-  run 3  p50 80  p99 311  p99.9 751  p99.99 19,157  max 377,793   faults 0  switches 1
-  run 4  p50 90  p99 321  p99.9 721  p99.99 20,570  max 628,486   faults 0  switches 0
-  run 5  p50 80  p99 301  p99.9 631  p99.99 19,378  max 1,069,809   faults 0  switches 0
+  run 1  p50 70  p99 271  p99.9 761  p99.99 14,488  max 295,359   faults 0  switches 1
+  run 2  p50 70  p99 291  p99.9 761  p99.99 13,726  max 10,959,399   faults 0  switches 0
+  run 3  p50 70  p99 240  p99.9 571  p99.99 13,606  max 652,769   faults 0  switches 1
+  run 4  p50 70  p99 260  p99.9 641  p99.99 13,476  max 907,861   faults 0  switches 0
+  run 5  p50 70  p99 260  p99.9 681  p99.99 14,097  max 260,675   faults 0  switches 1
+  prices       flat array of 4,096 levels from 97,957; 0 levels opened outside it
 
 latency (ns), median of 5 runs
                     count      p50      p99    p99.9   p99.99        max
-  all           2,000,000       80      301      661   19,638    812,075
-  add             999,655       90      230      481   19,518    670,961
-  cancel          799,831       70      220      401   18,506    323,317
-  modify          100,354      160      371      681   21,141     80,727
-  marketable      100,160      130      661    1,212   21,101    152,025
-  (spin)        2,000,000      100      120      190   17,744  1,565,694
+  all           2,000,000       70      260      681   13,726    652,769
+  add             999,655       80      170      541   16,562    652,769
+  cancel          799,831       40      130      391    2,124    110,722
+  modify          100,354      110      250      882   20,579     63,754
+  marketable      100,160      120      621    1,493   20,670     85,093
+  (spin)        2,000,000      100      110      180   14,327    716,509
 
 spread across runs, (max - min) / median
                                 p50      p99    p99.9   p99.99        max
-  all                          12%       7%      20%       7%       112%
-  add                           0%       4%      31%      11%       177%
-  cancel                        0%       9%      35%      43%       288%
-  modify                        6%       5%      53%      46%      1237%
-  marketable                    8%      11%      42%      78%       380%
-  (spin)                        0%      42%      47%      12%       628%
+  all                           0%      19%      28%       7%      1639%
+  add                           0%      24%      41%      11%       470%
+  cancel                        0%      23%     108%      27%       468%
+  modify                        0%      24%      58%      19%     17151%
+  marketable                    8%      15%      50%      24%       231%
+  (spin)                        0%       0%      67%      27%       327%
 ```
 
-**p50 through p99.9 are the engine.** The spin row stays at 100-190 ns there,
+**p50 through p99.9 are the engine.** The spin row stays at 100-180 ns there,
 while the operations are several times that.
 
 **p99.99 and max are the machine.** Spinning for 100 ns with no engine involved
-still reaches 18 µs at p99.99, the same range as every operation type. A
+still reaches 14 µs at p99.99, the same range as almost every operation type. A
 standalone check agrees: the count of multi-microsecond spikes grows in
 proportion to the length of the timed window, which is the signature of
 interrupts rather than of anything the code does.
 
-**What a result has to beat.** Overall p99 is stable to 7%, but per-type p99.9
-moves by up to 53% between runs. A change to the engine is real only when it
-exceeds the spread of the cell it claims to improve. For example, a 3% gain in
-cancel p99.9 is noise here. To compare two versions, use `tools/ab_compare.py`,
-described above.
+The exception proves the rule. Cancels became short enough that interrupts now
+land in fewer than 0.01% of them. Cancel's p99.99 has therefore dropped below
+the machine's floor to 2 µs, which is its own tail again. It is a threshold
+effect rather than a speedup of the same size, and it is not claimed as one.
+
+**What a result has to beat.** Spreads are wide in this session: overall p99
+moves by 19% between runs and per-type p99.9 by up to 108%, each widened by a
+single disturbed run. Read against this table alone, a change is real only when
+it exceeds the spread of the cell it claims to improve, so a 3% gain in cancel
+p99.9 is noise here. Comparing two versions is a different question, answered
+better by `tools/ab_compare.py`, described above.
 
 WSL2 has no cpufreq interface -- the Windows host owns the clock -- so the
 governor cannot be fixed from inside it. For tails worth quoting, use bare-metal
@@ -430,9 +496,42 @@ Linux:
 
 What the engine rows say:
 
-- Modify costs about twice an add, because it is a cancel plus an add.
-- Marketable orders have a p99 three times an add's, because a sweep erases
-  several orders and sometimes whole price levels.
+- **Modify costs more than an add,** because it is a cancel plus an add.
+- **Marketable orders have more than three times an add's p99.** A sweep
+  erases several orders and sometimes whole levels. The flat price array barely
+  moved them: their cost is the trades and the list erases, not finding the
+  level.
+
+### Optimization log
+
+One change at a time, each measured against the commit before it with
+`tools/ab_compare.py`: 11 interleaved pairs, the default flow, every operation
+type. Only cells the sign test marks count.
+
+| Change | p50 | p99 | p99.9 | Where it landed |
+|---|---|---|---|---|
+| Node arena instead of malloc | 100 → 80 | 451 → 321 (−29%) | 1,132 → 812 (−28%) | Every type. Marketable p99 −33%, add −34% |
+| Flat price array instead of `std::map` | 80 → 70 | 301 → 271 (−10%) | 711 → 651, not significant | p99 and p99.9: cancel −33% and −34%, modify −31% and −30%, add −22% and −18%. Marketable unchanged |
+
+Each row is its own paired measurement, so a row's "before" need not equal the
+previous row's "after". The machine drifts between sessions, which is why a
+change is judged only against its own baseline, measured alongside it. The flat
+array's full comparison:
+
+```
+                                    p50                         p99                       p99.9
+all              80 ->    70  -12% 11/11*     301 ->   271  -10% 11/11*     711 ->   651   -8%  8/11 
+add              90 ->    80  -11% 11/11*     230 ->   180  -22% 11/11*     571 ->   471  -18%  9/11*
+cancel           70 ->    40  -43% 11/11*     210 ->   140  -33% 11/11*     471 ->   311  -34% 10/11*
+modify          160 ->   110  -31% 11/11*     361 ->   250  -31% 11/11*     872 ->   611  -30% 10/11*
+marketable      130 ->   130   +0%  5/11      671 ->   651   -3%  6/11    1,503 -> 1,313  -13%  6/11 
+```
+
+Where the array helped most tracks what each operation does. A cancel or modify
+used to find its level by walking the tree, and now reaches it with a
+subtraction and a load. An add found its level the same way. A marketable order
+spends its time erasing orders and emitting trades, which the array does not
+touch.
 
 ### Before and after: the allocation tail
 
@@ -464,12 +563,13 @@ run-to-run spread are counted as results:
 | modify | 190 → 160 | 431 → 371 (−14%) | 902 → 681, within noise (53% spread) |
 | marketable | 160 → 130 | 1,002 → 661 (−34%) | 2,034 → 1,212, within noise (42% spread) |
 
-The allocator is not the whole tail. What remains at p99 is mostly cache
-misses: every operation chases pointers through a `std::map` of levels, a
-`std::list` per level and a hash bucket chain. At `--depth 200000`, where that
-working set outgrows the caches, both allocators sit near 1 µs at p99. Flatter
-structures -- intrusive order lists and price-indexed level arrays -- are the
-next target, and this benchmark is how to tell whether they work.
+The allocator was not the whole tail, and neither was the price map. At
+`--depth 200000`, where the working set outgrows the caches, the flat array
+still wins p50 and trims p99 from 982 to 912 ns. The tail stays near 1 µs,
+though. What remains there is per order: a `std::list` node for every order and
+a hash-bucket chain for every id, scattered across the heap. Intrusive order
+lists and a flat id index are the next targets, and this benchmark is how to
+tell whether they work.
 
 ## Build
 

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <limits>
 
 namespace lob {
 
@@ -41,7 +42,64 @@ namespace {
         if (!kArenaAllowed || !cfg.pool_nodes) return nullptr;
         return std::make_unique<NodeArena>(cfg.expected_orders * kBytesPerOrder);
     }
+
+    //A window of `levels` prices centred on `price`, shifted to stay inside
+    //the price range at either end.
+    Price centred_base(Price price, std::size_t levels) {
+        if (levels == 0) return price;
+        const Price half = levels / 2;
+        const Price highest = std::numeric_limits<Price>::max() - (levels - 1);
+        return std::min(price >= half ? price - half : 0, highest);
+    }
 }
+
+//--- PriceLadder -------------------------------------------------------------
+
+template <bool IsBid>
+PriceLadder<IsBid>::PriceLadder(std::size_t window_levels, NodeArena* a)
+    : arena(a), overflow(Ranking{}, ArenaAllocator<PriceLevel>(a)) {
+    window.reserve(window_levels);
+    for (std::size_t i = 0; i < window_levels; ++i) window.emplace_back(ArenaAllocator<Order>(a));
+}
+
+template <bool IsBid>
+void PriceLadder<IsBid>::place(Price base) {
+    lo = base;
+    //Clip so base + limit - 1 never passes the largest price.
+    const Price room = std::numeric_limits<Price>::max() - base;
+    limit = window.empty() || window.size() - 1 <= room ? window.size()
+                                                        : static_cast<std::size_t>(room) + 1;
+    is_placed = true;
+}
+
+#ifndef NDEBUG
+template <bool IsBid>
+void PriceLadder<IsBid>::check() const {
+    std::size_t count = 0;
+    for (std::size_t i = 0; i < window.size(); ++i) {
+        const PriceLevel& level = window[i];
+        if (level.orders.empty()) {
+            assert(level.total_qty == 0 && "empty array slot still holds quantity");
+            continue;
+        }
+        assert(i < limit && "occupied slot beyond the placed window");
+        ++count;
+        assert(!(IsBid ? i > best_idx : i < best_idx) && "best index is not the best level");
+    }
+    assert(count == occupied && "occupied count out of step with the array");
+    if (occupied > 0) assert(!window[best_idx].orders.empty() && "best index points at an empty slot");
+    for (const auto& [price, level] : overflow) {
+        assert(!in_window(price) && "a price inside the window was filed in the map");
+        assert(!level.orders.empty() && "empty level left in the map");
+    }
+}
+#else
+template <bool IsBid>
+void PriceLadder<IsBid>::check() const {}
+#endif
+
+template class PriceLadder<true>;
+template class PriceLadder<false>;
 
 //--- TradeRing ---------------------------------------------------------------
 
@@ -70,11 +128,21 @@ bool TradeRing::pop(Trade& out) {
 
 OrderBook::OrderBook(Config cfg)
     : arena(make_arena(cfg)),
-      bids(std::greater<Price>{}, ArenaAllocator<PriceLevel>(arena.get())),
-      asks(std::less<Price>{}, ArenaAllocator<PriceLevel>(arena.get())),
+      bids(cfg.price_levels, arena.get()),
+      asks(cfg.price_levels, arena.get()),
       order_index(ArenaAllocator<Locator>(arena.get())),
       trade_out(cfg.trade_capacity), policy(cfg.self_trade) {
     if (cfg.expected_orders > 0) order_index.reserve(cfg.expected_orders);
+    if (cfg.price_base) {
+        bids.place(*cfg.price_base);
+        asks.place(*cfg.price_base);
+    }
+}
+
+void OrderBook::place_windows(Price price) {
+    const Price base = centred_base(price, bids.capacity());
+    bids.place(base);
+    asks.place(base);
 }
 
 //Walk the opposite book best-price-first, filling `incoming` until it is
@@ -88,11 +156,12 @@ void OrderBook::match(BookSide& opposite, Order& incoming,
                                           : level_price >= *limit;
     };
 
-    while (incoming.qty > 0 && !opposite.empty()) {
-        auto level_it = opposite.begin();       //Best price on the far side
-        if (!crosses(level_it->first)) break;
+    while (incoming.qty > 0) {
+        Price level_price = 0;
+        PriceLevel* best = opposite.best(level_price);  //Best price on the far side
+        if (!best || !crosses(level_price)) break;
 
-        PriceLevel& level = level_it->second;
+        PriceLevel& level = *best;
         while (incoming.qty > 0 && !level.orders.empty()) {
             Order& resting = level.orders.front();      //Oldest wins
 
@@ -123,7 +192,7 @@ void OrderBook::match(BookSide& opposite, Order& incoming,
             level.total_qty -= traded;
 
             const Trade t{next_seq, resting.id, incoming.id,
-                          level_it->first, traded, incoming.side};
+                          level_price, traded, incoming.side};
             if (rep.trade_count == 0) rep.first_seq = next_seq;
             ++next_seq;
             ++rep.trade_count;
@@ -136,16 +205,15 @@ void OrderBook::match(BookSide& opposite, Order& incoming,
             }
         }
 
-        if (level.orders.empty()) opposite.erase(level_it);
+        if (level.orders.empty()) opposite.closed(level_price);
         if (rep.stp_halted) break;
     }
 }
 
 template <typename BookSide>
 void OrderBook::insert(BookSide& book, const Order& order) {
-    //try_emplace, not operator[]: a new level's list must share the arena.
-    PriceLevel& level = book.try_emplace(order.price, ArenaAllocator<Order>(arena.get()))
-                            .first->second;
+    if (!book.placed()) place_windows(order.price);     //First order to rest
+    PriceLevel& level = book.open(order.price);
     level.total_qty += order.qty;
     level.orders.push_back(order);
     order_index[order.id] = Locator{order.price, order.side, std::prev(level.orders.end())};
@@ -153,13 +221,12 @@ void OrderBook::insert(BookSide& book, const Order& order) {
 
 template <typename BookSide>
 void OrderBook::remove(BookSide& book, const Locator& loc) {
-    auto level_it = book.find(loc.price);
-    if (level_it == book.end()) return;
+    PriceLevel* level = book.find(loc.price);
+    if (!level) return;
 
-    PriceLevel& level = level_it->second;
-    level.total_qty -= loc.order_iter->qty;
-    level.orders.erase(loc.order_iter);
-    if (level.orders.empty()) book.erase(level_it);
+    level->total_qty -= loc.order_iter->qty;
+    level->orders.erase(loc.order_iter);
+    if (level->orders.empty()) book.closed(loc.price);
 }
 
 ExecReport OrderBook::submit(OrderId id, ParticipantId owner, Side side,
@@ -240,32 +307,18 @@ ExecReport OrderBook::modify(OrderId id, Price new_price, Quantity new_qty) {
 
 //--- queries -----------------------------------------------------------------
 
-std::optional<Price> OrderBook::best_bid() const {
-    if (bids.empty()) return std::nullopt;
-    return bids.begin()->first;
-}
+std::optional<Price> OrderBook::best_bid() const {return bids.best_price();}
 
-std::optional<Price> OrderBook::best_ask() const {
-    if (asks.empty()) return std::nullopt;
-    return asks.begin()->first;
-}
+std::optional<Price> OrderBook::best_ask() const {return asks.best_price();}
 
 Volume OrderBook::qty_at(Side side, Price price) const {
-    if (side == Side::Buy) {
-        auto it = bids.find(price);
-        return it == bids.end() ? 0 : it->second.total_qty;
-    }
-    auto it = asks.find(price);
-    return it == asks.end() ? 0 : it->second.total_qty;
+    const PriceLevel* level = side == Side::Buy ? bids.find(price) : asks.find(price);
+    return level ? level->total_qty : 0;
 }
 
 std::size_t OrderBook::order_count_at(Side side, Price price) const {
-    if (side == Side::Buy) {
-        auto it = bids.find(price);
-        return it == bids.end() ? 0 : it->second.orders.size();
-    }
-    auto it = asks.find(price);
-    return it == asks.end() ? 0 : it->second.orders.size();
+    const PriceLevel* level = side == Side::Buy ? bids.find(price) : asks.find(price);
+    return level ? level->orders.size() : 0;
 }
 
 const Order* OrderBook::find(OrderId id) const {
@@ -279,7 +332,8 @@ const Order* OrderBook::find(OrderId id) const {
 #ifndef NDEBUG
 template <typename BookSide>
 void OrderBook::check_side(const BookSide& book, Side side, std::size_t& counted) const {
-    for (const auto& [price, level] : book) {
+    book.check();
+    book.for_each_level([&](Price price, const PriceLevel& level) {
         assert(!level.orders.empty() && "empty price level should have been erased");
 
         Volume sum = 0;
@@ -299,7 +353,7 @@ void OrderBook::check_side(const BookSide& book, Side side, std::size_t& counted
         assert(sum == level.total_qty && "level total != sum of its orders");
         assert(level.total_qty > 0 && "level exists with zero quantity");
         counted += level.orders.size();
-    }
+    });
 }
 
 void OrderBook::check_invariants() const {
@@ -308,9 +362,9 @@ void OrderBook::check_invariants() const {
     check_side(asks, Side::Sell, counted);
     assert(counted == order_index.size() && "index size != number of resting orders");
 
-    if (!bids.empty() && !asks.empty()) {
-        assert(bids.begin()->first < asks.begin()->first && "book is crossed");
-    }
+    const auto bid = bids.best_price();
+    const auto ask = asks.best_price();
+    if (bid && ask) assert(*bid < *ask && "book is crossed");
 }
 #else
 void OrderBook::check_invariants() const {}

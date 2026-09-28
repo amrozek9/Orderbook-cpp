@@ -2,6 +2,8 @@
 #include "diff_harness.hpp"
 
 #include <iostream>
+#include <limits>
+#include <optional>
 
 using difftest::GenConfig;
 using difftest::Generator;
@@ -16,19 +18,34 @@ namespace {
 //Run `count` random sequences through both implementations. On the first
 //divergence, shrink it and print something you can paste into a test.
 void sweep(std::uint64_t first_seed, std::size_t count, GenConfig cfg,
-           SelfTradePolicy policy) {
+           const lob::Config& engine) {
     for (std::size_t i = 0; i < count; ++i) {
         const std::uint64_t seed = first_seed + i;
         const Sequence ops = Generator(seed, cfg).generate();
-        if (!difftest::diverges(ops, policy)) continue;
+        if (!difftest::diverges(ops, engine)) continue;
 
-        const Sequence minimal = difftest::shrink(ops, policy);
+        const Sequence minimal = difftest::shrink(ops, engine);
         std::cerr << "\nDIVERGENCE seed=" << seed
                   << " shrunk " << ops.size() << " ops -> " << minimal.size()
-                  << difftest::format(minimal, policy) << std::endl;
+                  << difftest::format(minimal, engine) << std::endl;
         FAIL("engine and reference disagree, seed " << seed);
     }
     SUCCEED("no divergence in " << count << " sequences");
+}
+
+void sweep(std::uint64_t first_seed, std::size_t count, GenConfig cfg,
+           SelfTradePolicy policy) {
+    sweep(first_seed, count, cfg, difftest::engine_config(policy));
+}
+
+//An engine whose flat price array holds `levels` prices from `base`, or is
+//centred on the first resting price when `base` is empty.
+lob::Config window(std::size_t levels, std::optional<lob::Price> base,
+                   SelfTradePolicy policy = SelfTradePolicy::CancelResting) {
+    lob::Config cfg = difftest::engine_config(policy);
+    cfg.price_levels = levels;
+    cfg.price_base = base;
+    return cfg;
 }
 
 }
@@ -70,6 +87,46 @@ TEST_CASE("Differential: long sequences churn the index") {
     GenConfig cfg;
     cfg.length = 250;
     sweep(250000, 200, cfg, SelfTradePolicy::CancelResting);
+}
+
+//--- the price window --------------------------------------------------------
+//The reference has no window, so its shape must be invisible: identical trades,
+//reports and queues whether a level sits in the flat array or the fallback map,
+//and while the best price crosses between the two. The generator's band is
+//997..1003, and each shape below puts its edges somewhere different.
+
+TEST_CASE("Differential: a window narrower than the price band") {
+    //999..1001 in the array; levels open on both sides of it, and the best
+    //price on each side keeps crossing its edges.
+    sweep(290000, 1000, GenConfig{}, window(3, 999));
+}
+
+TEST_CASE("Differential: window edges under the other self-trade policies") {
+    sweep(300000, 600, GenConfig{}, window(3, 999, SelfTradePolicy::Allow));
+    sweep(310000, 600, GenConfig{}, window(3, 999, SelfTradePolicy::CancelIncoming));
+}
+
+TEST_CASE("Differential: a small window centred on the first resting price") {
+    //Where the edges land depends on the sequence, so every seed differs.
+    sweep(320000, 1000, GenConfig{}, window(4, std::nullopt));
+}
+
+TEST_CASE("Differential: a one-level window") {
+    sweep(330000, 800, GenConfig{}, window(1, std::nullopt));
+}
+
+TEST_CASE("Differential: no window, every level in the map") {
+    sweep(340000, 800, GenConfig{}, window(0, std::nullopt));
+}
+
+TEST_CASE("Differential: a window that misses every price") {
+    sweep(350000, 800, GenConfig{}, window(64, 5000));
+}
+
+TEST_CASE("Differential: a window pressed against the top of the price range") {
+    GenConfig cfg;
+    cfg.mid = std::numeric_limits<lob::Price>::max() - 3;   //Band ends at the max price
+    sweep(360000, 800, cfg, window(4, std::nullopt));
 }
 
 //--- the harness itself must be trustworthy ----------------------------------

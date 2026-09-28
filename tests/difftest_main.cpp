@@ -12,6 +12,8 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <iterator>
+#include <optional>
 #include <string>
 
 int main(int argc, char** argv) {
@@ -25,6 +27,21 @@ int main(int argc, char** argv) {
         lob::SelfTradePolicy::CancelIncoming,
     };
 
+    //Price-window shapes against the generator's 997..1003 band: the default
+    //(everything in the array), a window narrower than the band, one level
+    //centred on the first resting price, a small centred window, and none.
+    struct Window {
+        std::size_t levels;
+        std::optional<lob::Price> base;
+    };
+    const Window windows[] = {
+        {lob::Config{}.price_levels, std::nullopt},
+        {3, 999},
+        {1, std::nullopt},
+        {4, std::nullopt},
+        {0, std::nullopt},
+    };
+
     difftest::GenConfig cfg;
     cfg.length = length;
 
@@ -34,15 +51,20 @@ int main(int argc, char** argv) {
 
     for (std::size_t i = 0; i < count; ++i) {
         const std::uint64_t seed = first_seed + i;
-        //Rotate the policy so all three get exercised across the run.
-        const lob::SelfTradePolicy policy = policies[seed % 3];
+        //Rotate the policy and the price window's shape, so every policy meets
+        //every way a level can be filed: in the array, in the fallback map,
+        //and crossing between them.
+        lob::Config engine = difftest::engine_config(policies[seed % 3]);
+        const Window& w = windows[(seed / 3) % std::size(windows)];
+        engine.price_levels = w.levels;
+        engine.price_base = w.base;
         const auto ops = difftest::Generator(seed, cfg).generate();
 
-        if (difftest::diverges(ops, policy)) {
-            const auto minimal = difftest::shrink(ops, policy);
+        if (difftest::diverges(ops, engine)) {
+            const auto minimal = difftest::shrink(ops, engine);
             std::printf("\nDIVERGENCE at seed %llu: shrunk %zu ops -> %zu\n%s\n",
                         (unsigned long long)seed, ops.size(), minimal.size(),
-                        difftest::format(minimal, policy).c_str());
+                        difftest::format(minimal, engine).c_str());
             return 1;
         }
 

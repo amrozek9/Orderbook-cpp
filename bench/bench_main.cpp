@@ -8,11 +8,14 @@
 // max -- overall and per operation type. No mean is reported.
 //
 //   ./bench [--ops N] [--warmup N] [--runs R] [--seed S] [--depth D]
-//           [--cpu C | --no-pin] [--prefault MiB] [--system-alloc] [--dump FILE]
+//           [--cpu C | --no-pin] [--prefault MiB] [--system-alloc]
+//           [--price-levels N] [--dump FILE]
 //
 // --dump writes every timed sample, and every noise-floor sample, as CSV for
 // tools/plot_latency.py. --system-alloc puts the book's container nodes back
-// on malloc: the same binary then produces both sides of a before/after plot.
+// on malloc, and --price-levels 0 files every price level in a std::map
+// instead of the flat array: the same binary then produces both sides of a
+// before/after comparison for either change.
 //
 // Method, and how each part is checked rather than assumed:
 //
@@ -64,6 +67,7 @@
 #include <cstring>
 #include <fstream>
 #include <numeric>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -321,6 +325,8 @@ struct RunResult {
     bool stayed_on_cpu = true;
     std::uint64_t trade_hash = 0;
     std::uint64_t dropped = 0;
+    std::optional<lob::Price> window_base;      //Where the flat price array landed
+    std::uint64_t opened_outside = 0;           //Levels that fell back to the map
 };
 
 class Bench {
@@ -361,6 +367,8 @@ public:
         res.stayed_on_cpu = cpu < 0 || current_cpu() == cpu;
         res.trade_hash = hash;
         res.dropped = book.trades().dropped();
+        res.window_base = book.price_window_base();
+        res.opened_outside = book.levels_opened_outside_window();
 
         if (dump) {
             for (std::size_t i = 0; i < n; ++i)
@@ -523,7 +531,8 @@ void print_summary(const std::vector<RunResult>& runs, const flow::Flow& f, doub
 [[noreturn]] void usage(const char* argv0) {
     std::fprintf(stderr,
         "usage: %s [--ops N] [--warmup N] [--runs R] [--seed S] [--depth D]\n"
-        "          [--cpu C | --no-pin] [--prefault MiB] [--system-alloc] [--dump FILE]\n"
+        "          [--cpu C | --no-pin] [--prefault MiB] [--system-alloc]\n"
+        "          [--price-levels N] [--dump FILE]\n"
         "  --ops       timed operations per run (default 2000000)\n"
         "  --warmup    mixed operations run before recording (default 300000)\n"
         "  --runs      repetitions, each on a fresh book (default 5)\n"
@@ -533,6 +542,8 @@ void print_summary(const std::vector<RunResult>& runs, const flow::Flow& f, doub
         "  --no-pin    do not pin\n"
         "  --prefault  MiB of heap to pre-fault on glibc (default 64)\n"
         "  --system-alloc  container nodes from malloc, not the book's arena\n"
+        "  --price-levels  prices in the flat array, centred on the first resting\n"
+        "              order (default 4096); 0 puts every level in a std::map\n"
         "  --dump      write every sample as CSV: run,index,kind,ns\n", argv0);
     std::exit(2);
 }
@@ -560,6 +571,7 @@ int main(int argc, char** argv) {
     std::size_t prefault_mib = 64;
     int cpu = default_cpu();
     bool system_alloc = false;
+    std::size_t price_levels = 4096;
     const char* dump_path = nullptr;
     for (int i = 1; i < argc; ++i) {
         const auto value = [&]() -> const char* {
@@ -575,6 +587,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--no-pin"))   cpu = -1;
         else if (!std::strcmp(argv[i], "--prefault")) prefault_mib = std::strtoull(value(), nullptr, 10);
         else if (!std::strcmp(argv[i], "--system-alloc")) system_alloc = true;
+        else if (!std::strcmp(argv[i], "--price-levels")) price_levels = std::strtoull(value(), nullptr, 10);
         else if (!std::strcmp(argv[i], "--dump"))     dump_path = value();
         else usage(argv[0]);
     }
@@ -597,6 +610,9 @@ int main(int argc, char** argv) {
     lob::Config book_cfg{cfg.self_trade, flow::kTradeCapacity};
     book_cfg.pool_nodes = !system_alloc;
     book_cfg.expected_orders = system_alloc ? 0 : 2 * cfg.target_depth;
+    //Wide enough that the flow's slowly walking mid never leaves it; the
+    //report counts any level that does.
+    book_cfg.price_levels = price_levels;
     const bool pooled = lob::OrderBook(book_cfg).pools_nodes();
     Bench bench(f, cfg, book_cfg);
     const std::size_t prefaulted = prefault_heap(prefault_mib);
@@ -673,6 +689,14 @@ int main(int argc, char** argv) {
     }
     std::printf("  trade stream %016llx in every run, matching the generator\n",
                 (unsigned long long)st.trade_hash);
+    std::uint64_t outside = 0;
+    for (const RunResult& r : results) outside = std::max(outside, r.opened_outside);
+    if (price_levels == 0)
+        std::printf("  prices       no flat array (--price-levels 0): every level in a std::map\n");
+    else if (results.front().window_base)
+        std::printf("  prices       flat array of %s levels from %s; %s level%s opened outside it\n",
+                    grouped(price_levels).c_str(), grouped(*results.front().window_base).c_str(),
+                    grouped(outside).c_str(), outside == 1 ? "" : "s");
 
     print_summary(results, f, ticks_per_ns);
 

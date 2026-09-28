@@ -194,19 +194,38 @@ inline bool operator==(const Observed& a, const Observed& b) {
     return a.queue == b.queue;
 }
 
-Observed run_engine(const Sequence& ops, SelfTradePolicy policy);
+//The engine's configuration for a run. The reference book has no price
+//window, so the window's shape -- which levels live in the flat array and
+//which fall back to the map -- must never change a single observable.
+inline lob::Config engine_config(SelfTradePolicy policy) {
+    return lob::Config{policy, 1u << 16};
+}
+
+Observed run_engine(const Sequence& ops, const lob::Config& cfg);
+inline Observed run_engine(const Sequence& ops, SelfTradePolicy policy) {
+    return run_engine(ops, engine_config(policy));
+}
 Observed run_reference(const Sequence& ops, SelfTradePolicy policy);
 
 //True when the two implementations disagree on this sequence.
+inline bool diverges(const Sequence& ops, const lob::Config& cfg) {
+    return !(run_engine(ops, cfg) == run_reference(ops, cfg.self_trade));
+}
 inline bool diverges(const Sequence& ops, SelfTradePolicy policy) {
-    return !(run_engine(ops, policy) == run_reference(ops, policy));
+    return diverges(ops, engine_config(policy));
 }
 
 //Greedy delta-debugging: drop operations while the divergence survives.
 //Shrinks a 60-op sequence to the handful that actually matter.
-Sequence shrink(Sequence failing, SelfTradePolicy policy);
+Sequence shrink(Sequence failing, const lob::Config& cfg);
+inline Sequence shrink(Sequence failing, SelfTradePolicy policy) {
+    return shrink(std::move(failing), engine_config(policy));
+}
 
 //Reproducible C++ for a failing sequence, ready to paste into a test.
-std::string format(const Sequence& ops, SelfTradePolicy policy);
+std::string format(const Sequence& ops, const lob::Config& cfg);
+inline std::string format(const Sequence& ops, SelfTradePolicy policy) {
+    return format(ops, engine_config(policy));
+}
 
 }
