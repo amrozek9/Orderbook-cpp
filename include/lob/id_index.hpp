@@ -66,7 +66,7 @@ public:
 
     //Adds an id the caller knows is absent.
     void insert(Key id, const Value& value) {
-        if ((count + 1) * 2 > table.size()) grow();
+        if ((count + 1) * 2 > table.size()) [[unlikely]] grow();
         place(id, value);
         ++count;
     }

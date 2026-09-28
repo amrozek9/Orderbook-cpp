@@ -73,12 +73,12 @@ public:
     //A slot for a new value; its links are reset.
     SlotIndex acquire() {
         SlotIndex i;
-        if (free_head != kNoSlot) {
+        if (free_head != kNoSlot) [[likely]] {     //Churn keeps the free list stocked
             i = free_head;
             unpoison(i);
             free_head = slots[i].next;
         } else {
-            if (used == slots.size()) grow();
+            if (used == slots.size()) [[unlikely]] grow();
             i = static_cast<SlotIndex>(used++);
         }
         slots[i].prev = slots[i].next = kNoSlot;

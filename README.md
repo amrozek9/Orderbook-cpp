@@ -668,6 +668,8 @@ operation type. Only cells the sign test marks count.
 | Flat id index instead of `std::unordered_map` (15 pairs) | 70 → 50 | 311 → 240 (−23%) | 832 → 581 (−30%) | add and marketable about −30% at p99 and p99.9; cancel within noise. On a 200,000-order book: p99 992 → 561 (−43%), p99.9 2,735 → 1,182 (−57%) |
 | 32-byte hot order slot instead of 40 (15 pairs) | 50 → 50 | 210 → 210, not significant | 611 → 561, not significant | cancel p50 50 → 40; nothing else significant, and no change on a 200,000-order book |
 | 16-byte price levels instead of 24 (15 pairs) | 50 → 50 | 190 → 190, not significant | 401 → 401, not significant | nothing significant at either depth |
+| *Rejected:* order path specialized on side (15 pairs) | 50 → 50 | 190 → 190, not significant | 421 → 431, not significant | marketable p50 90 → 100 and p99 401 → 421, both significantly **worse**. Reverted |
+| Profile-guided branch hints (15 pairs) | 50 → 50 | 190 → 190, not significant | 401 → 411, not significant | add p99 −8% and p99.9 −7%; on a 200,000-order book, add p99 −6% and modify p50 −11% |
 
 Each row is its own paired measurement, so a row's "before" need not equal the
 previous row's "after". The machine drifts between sessions, which is why a
@@ -780,6 +782,86 @@ benchmark's 4,096-level window fits in L2 at either size (96 KiB against 64
 KiB), and a sweep or a scan for the next best price touches a few adjacent
 levels either way. Dropping the stored order count took nothing from the
 matching path, since only `order_count_at()` read it.
+
+Specializing the order path on side was tried and rejected. The guide this
+follows recommends it: pick `submit<Side::Buy>` or `submit<Side::Sell>` once at
+the API, so no loop tests the side. Measured, it made marketable orders a clock
+step slower:
+
+```
+                                    p50                         p99                       p99.9
+all              50 ->    50   +0%  1/15      190 ->   190   +0%  1/15      421 ->   431   +2%  4/15 
+add              50 ->    50   +0%  1/15      120 ->   120   +0%  5/15      281 ->   271   -4%  8/15 
+cancel           40 ->    40   +0%  0/15      120 ->   120   +0%  2/15      291 ->   301   +3%  6/15 
+modify           90 ->    90   +0%  7/15*     240 ->   230   -4%  6/15      511 ->   521   +2%  7/15 
+marketable       90 ->   100  +11%  0/15*     401 ->   421   +5%  1/15*     832 ->   832   +0%  5/15 
+```
+
+The branch it removed, the side test inside the crossing check, was already
+perfectly predicted: every level an order visits takes it the same way. So
+there was nothing to win, and the specialized code inlined and laid out
+differently, which cost marketable orders a clock step. The code got smaller,
+not larger, so this is layout rather than instruction-cache pressure. The diff
+was reverted rather than committed.
+
+### Branch profile
+
+Hints follow a profile, not intuition. No hardware counters are available
+under WSL2, so the profile comes from `gcov`. The engine is compiled with
+`--coverage` at `-O0`, so each source branch keeps its own counter, and one
+benchmark pass counts which way every branch went:
+
+```sh
+mkdir -p build-prof && cd build-prof
+c++ -O0 -DNDEBUG -std=gnu++20 --coverage -I../include -c ../src/order_book.cpp -o order_book.o
+c++ -O2 -DNDEBUG -std=gnu++20 -I../include -I../bench ../src/node_arena.cpp \
+    ../bench/flow.cpp ../bench/bench_main.cpp order_book.o --coverage -o bench-prof -pthread
+./bench-prof --runs 1 --ops 1000000 --warmup 100000
+gcov -b -c -o . ../src/order_book.cpp     # then read order_book.cpp.gcov
+```
+
+A branch got a hint only if the profile put it at least 95% one way:
+
+| Branch | Profiled | Hint |
+|---|---|---|
+| Level checked by a taker does not cross | 95.5% of 1.28M checks | `[[likely]]` on the early exit |
+| Taker and maker share an owner (self-trade) | 2% of 280,000 makers touched | `[[unlikely]]` |
+| A sweep empties the level | 5% | `[[unlikely]]` |
+| A cancel empties the level | 0.5% | `[[unlikely]]` |
+| A cancel finds its order | 100% of 989,000 | `[[unlikely]]` on the miss |
+| Duplicate id or zero quantity on submit | 0 of 1.33M | `[[unlikely]]` |
+| Appending to a non-empty level | 99% | `[[likely]]` |
+| An add opens a new level | 0.9% | `[[unlikely]]` |
+| Price inside the flat array; fallback map in use | 100%; never | `[[likely]]`; `[[unlikely]]` |
+| Free slot available in the pool; pool or index must grow | ~100%; never | `[[likely]]`; `[[unlikely]]` |
+
+Not hinted: a maker filled completely (80%), the first trade of a taker (40%),
+and the two link fixups when a queue entry is unlinked (80/20 and 62/38). The
+predictor learns those patterns on its own, and a hint would only move code.
+
+The same change hoisted the loop-invariant half of the self-trade test: whether
+the taker is owned under a preventing policy is computed once per order, not
+once per maker. The result is small and all on the good side:
+
+```
+                                    p50                         p99                       p99.9
+all              50 ->    50   +0%  2/15      190 ->   190   +0%  4/15      401 ->   411   +2%  5/15 
+add              50 ->    50   +0%  2/15      120 ->   110   -8% 10/15*     281 ->   261   -7% 11/15*
+cancel           40 ->    40   +0%  5/15      130 ->   130   +0%  6/15      261 ->   271   +4%  5/15 
+modify           90 ->    90   +0%  2/15      240 ->   240   +0%  9/15      431 ->   441   +2%  8/15 
+marketable      100 ->    90  -10%  7/15*     411 ->   421   +2%  5/15      711 ->   701   -1%  5/15 
+```
+
+On a 200,000-order book, 15 pairs:
+
+```
+                                    p50                         p99                       p99.9
+all              50 ->    50   +0%  0/15      531 ->   511   -4%  8/15    1,012 -> 1,012   +0%  9/15 
+add              50 ->    50   +0%  0/15      170 ->   160   -6% 11/15*     361 ->   351   -3% 11/15*
+cancel           40 ->    40   +0%  0/15      511 ->   501   -2%  7/15      771 ->   741   -4%  9/15 
+modify           90 ->    80  -11% 11/15*     691 ->   671   -3%  8/15    1,172 -> 1,062   -9%  7/15 
+marketable      170 ->   160   -6%  7/15    1,072 -> 1,062   -1%  9/15    1,924 -> 1,904   -1% 12/15*
+```
 
 ### Before and after: the allocation tail
 
