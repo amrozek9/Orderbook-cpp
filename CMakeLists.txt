@@ -58,7 +58,8 @@ add_executable(tests
     tests/test_flow.cpp
     tests/test_node_arena.cpp
     tests/test_price_window.cpp
-    tests/test_slot_pool.cpp)
+    tests/test_slot_pool.cpp
+    tests/test_id_index.cpp)
 target_compile_options(tests PRIVATE -Wall -Wextra -Wpedantic)
 target_link_libraries(tests PRIVATE lob difftest_harness lob_flow
                       Catch2::Catch2WithMain Threads::Threads)

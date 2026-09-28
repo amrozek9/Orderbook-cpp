@@ -6,10 +6,10 @@
 #include <memory>
 #include <optional>
 #include <type_traits>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include "lob/id_index.hpp"
 #include "lob/node_arena.hpp"
 #include "lob/slot_pool.hpp"
 
@@ -25,10 +25,10 @@
 // Trades leave through a fixed-capacity ring buffer (lob::TradeRing) that the
 // caller drains. Nothing in the matching path formats or performs I/O --
 // printing a fill inside the hot loop would make every measurement of it
-// meaningless. Orders live in a pre-allocated slot pool and the remaining
-// container nodes come from a per-book NodeArena, so a book provisioned with
-// Config::expected_orders does not call the system allocator while matching
-// either.
+// meaningless. Orders live in a pre-allocated slot pool, the id index is one
+// flat table, and the fallback map's nodes come from a per-book NodeArena, so a
+// book provisioned with Config::expected_orders does not call the system
+// allocator while matching either.
 //
 // Threading: an OrderBook is not thread-safe. Distinct books share no state and
 // may run concurrently on separate threads; a single book may move between
@@ -282,16 +282,16 @@ namespace lob {
     struct Config {
         SelfTradePolicy self_trade = SelfTradePolicy::CancelResting;
         std::size_t trade_capacity = 4096;
-        //Container nodes come from a per-book NodeArena. False puts them back
-        //on the system allocator, to benchmark the difference. Always false
-        //under AddressSanitizer, so freed nodes stay poisoned and quarantined
-        //and a dangling locator is still caught.
+        //The fallback map's nodes come from a per-book NodeArena. False puts
+        //them back on the system allocator, to benchmark the difference.
+        //Always false under AddressSanitizer, so freed nodes stay poisoned and
+        //quarantined.
         bool pool_nodes = true;
         //Resting orders to provision for at construction: the order pool
-        //allocates and touches this many slots, the arena pre-faults room for
-        //their index entries, and the index reserves buckets. A book that stays
-        //within it never allocates or rehashes while matching. 0 starts the
-        //pool at 1,024 slots, doubling as needed.
+        //allocates and touches this many slots, the id index sizes its table
+        //to stay at most half full, and the arena pre-faults room for fallback
+        //levels. A book that stays within it never allocates or rehashes while
+        //matching. 0 starts both at 1,024 orders, doubling as needed.
         std::size_t expected_orders = 0;
         //Consecutive prices, in ticks, whose levels live in each side's flat
         //array. Prices outside fall back to a std::map: correct, but slower.
@@ -350,7 +350,7 @@ namespace lob {
         const Order* find(OrderId id) const;
 
         std::size_t size() const {return order_index.size();}
-        bool empty() const {return order_index.empty();}
+        bool empty() const {return order_index.size() == 0;}
         SelfTradePolicy self_trade_policy() const {return policy;}
 
         //Visit every resting order in book order: bids best-first, then asks
@@ -390,17 +390,16 @@ namespace lob {
         //Times the pool ran out and doubled, copying every order: a stall
         //that sizing Config::expected_orders correctly avoids.
         std::uint64_t order_pool_growths() const {return pool.growths();}
+        //Times the id index passed half full and rehashed: the same kind of
+        //stall, avoided the same way.
+        std::uint64_t id_index_growths() const {return order_index.growths();}
 
     private:
-        using OrderIndex = std::unordered_map<OrderId, SlotIndex, std::hash<OrderId>,
-                                              std::equal_to<OrderId>,
-                                              ArenaAllocator<std::pair<const OrderId, SlotIndex>>>;
-
         std::unique_ptr<NodeArena> arena;       //Null: system allocator. Outlives the containers
         SlotPool<Order> pool;                   //Every resting order, and its queue links
         PriceLadder<true> bids;
         PriceLadder<false> asks;
-        OrderIndex order_index;                 //OrderId -> its slot in the pool
+        IdIndex<SlotIndex> order_index;         //OrderId -> its slot in the pool
 
         TradeRing trade_out;
         SelfTradePolicy policy;

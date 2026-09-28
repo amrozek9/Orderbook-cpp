@@ -137,10 +137,15 @@ TEST_CASE("book: a provisioned book never calls the system allocator while match
     CHECK(allocations_while_matching(book) == 0);
 }
 
-TEST_CASE("book: the same flow on the system allocator does allocate") {
-    //Keeps the test above honest: the counter sees container allocations.
+TEST_CASE("book: levels filed in the map on malloc do allocate") {
+    //Keeps the test above honest: the counter sees container allocations. The
+    //pool and the flat id index need none, so this turns off the one thing
+    //that still takes a node per level -- the flat price array -- and puts the
+    //map's nodes on malloc.
     lob::Config cfg;
+    cfg.expected_orders = 2'000;
+    cfg.price_levels = 0;
     cfg.pool_nodes = false;
     lob::OrderBook book(cfg);
-    CHECK(allocations_while_matching(book) > 10'000);
+    CHECK(allocations_while_matching(book) > 500);
 }

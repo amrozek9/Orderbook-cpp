@@ -3,9 +3,9 @@
 Price-time priority matching engine. Each side of the book is a flat array of
 price levels indexed by price, with a `std::map` for prices outside it. Each
 level is a FIFO queue of orders threaded by 32-bit index through a pre-allocated
-pool of order slots, and an `unordered_map<OrderId, slot>` makes cancel-by-id
-O(1). The index's nodes, and the map's, come from a per-book arena rather than
-malloc.
+pool of order slots, and a flat, open-addressed id index makes cancel-by-id
+O(1). Only the fallback map still has nodes, and they come from a per-book
+arena rather than malloc.
 
 ```cpp
 lob::OrderBook book;
@@ -122,7 +122,7 @@ slot a cancel frees is the next one an add takes.
 | | `std::list` in the arena | Slot pool |
 |---|---|---|
 | Per order | 48-byte list node, anywhere in the arena's slabs | 40-byte slot, contiguous with every other order |
-| Id index entry | 24-byte locator (price, side, iterator); 48-byte node | 4-byte slot index; 32-byte node |
+| Id index entry | 24-byte locator (price, side, iterator); 48-byte node | 4-byte slot index; 32-byte node, and now a 16-byte entry in the flat index |
 | Price level | 40 bytes, so 4,096 levels take 160 KiB per side | 24 bytes, so 96 KiB per side |
 | Link | 8-byte pointer | 4-byte index |
 
@@ -143,8 +143,8 @@ order. They also survive the block moving, which is what makes growth possible:
 The guide this follows says `std::list` calls `operator new` for every order.
 Here the arena had already taken the system allocator off the hot path, so what
 the pool buys is size and locality. Orders now need no allocator at all. The id
-index's hash nodes still come from the arena: one per resting order, and the
-last per-order node left. A flat, open-addressed id index would remove it.
+index's hash nodes were the last per-order node left; the flat id index below
+removed them.
 
 Measured against the `std::list` it replaced, the pool bought p50 (70 → 60 ns)
 and add's p99.9; p99 overall moved within noise. The
@@ -157,14 +157,66 @@ checker walks every queue both ways and ties each queued slot to the id index.
 It also requires the free list and the live slots to account for every slot
 ever used.
 
-### Index and map nodes come from a per-book arena
+### The id index is one flat table
 
-Every resting order costs a hash-map node in the id index, plus a map node if it
-opens a level outside the price window, and every cancel or fill frees them.
-Before the order pool, each order cost a `std::list` node too. Through malloc,
+`std::unordered_map` is a chained hash table. Every lookup loads the bucket
+array, then follows a pointer to a node elsewhere on the heap: two dependent
+cache misses on a big book, plus a node to allocate on every add and free on
+every cancel. `IdIndex` is a single array of 16-byte entries (id, slot index,
+occupied flag), four to a cache line:
+
+- **The hash keeps sequential ids sequential:** `(id ^ id >> log2(capacity))`,
+  masked. Exchanges hand out ids in order, so consecutive adds land in
+  consecutive entries, in cache lines already fetched, and cancels of recent
+  orders hit lines still in cache. Folding in the high bits stops ids exactly
+  a table apart from all piling onto one slot, which is what separates it from
+  a plain identity hash.
+- **Linear probing.** A collision moves to the next entry, which is usually in
+  the same cache line and otherwise the one the prefetcher is fetching.
+- **Power-of-two capacity, at most half full.** Probe runs stay short, and the
+  home slot is a shift rather than a division.
+- **Backward-shift deletion.** Erasing an entry pulls the entries after it back
+  into the gap, instead of leaving a tombstone. A table that sees millions of
+  adds and cancels never slows down.
+
+The hash was chosen by measurement. The first version used Fibonacci hashing,
+a multiply that scatters sequential ids evenly across the table. On the default
+book it won big, but on a 200,000-order book the table is 16 MiB, as large as
+the whole L3. Scattered, every add landed on a cold line, and add p50 went from
+70 to 180 ns. Locality-preserving hashing fixed that and beat the old
+`std::unordered_map` at both depths; the [optimization
+log](#optimization-log) has the numbers.
+
+The tradeoffs:
+
+- **Growth rehashes the whole table** once, when it passes half full. The book
+  counts it (`id_index_growths()`) and the benchmark reports it: never, on its
+  flow. `Config::expected_orders` sizes the table up front.
+- **Memory is 2 to 4 entries per expected order.** The benchmark's 10,000-order
+  provision is a 32,768-entry table, 512 KiB, mostly empty. Each lookup touches
+  one line of it.
+- **An erase scans to the end of its run.** Sequential ids make the newest
+  orders one dense run of occupied entries, and backward-shift deletion has to
+  check every entry after the gap. A cancel therefore scans the orders added
+  after it, a handful on this flow. It is why cancel gains least from this
+  change. Robin Hood ordering would let the scan stop at the first entry
+  sitting at its home, and is the next candidate.
+- **The hash assumes ids nobody chose to collide.** Crafted keys defeat it
+  easily. That is acceptable because the book assigns or receives ids from the
+  venue, never from a client choosing them freely. Client-supplied ids would
+  want a keyed hash.
+
+With orders in the pool and ids in the flat table, nothing per order is a node
+any more. The arena below now serves only levels outside the price window.
+
+### Fallback map nodes come from a per-book arena
+
+Before the order pool and the flat id index, every resting order cost a
+`std::list` node and a hash-map node, plus a map node if it opened a level
+outside the price window, and every cancel or fill freed them. Through malloc,
 that traffic was a large share of the latency tail -- measured, not assumed;
 see [Before and after](#before-and-after-the-allocation-tail). `lob::NodeArena`
-replaced it:
+replaced it, and still serves the one container left, the fallback map:
 
 - **One arena per book,** so there is still no global state, and distinct books
   still run on distinct threads.
@@ -214,8 +266,9 @@ operation that caused it rather than three operations later. It checks that:
 - no level exists with zero orders or zero quantity;
 - each level's queue links agree in both directions, and its tail and count
   match the orders actually in it;
-- the id index holds exactly one entry per resting order, and each entry names
-  the slot where that order is queued;
+- the id index holds exactly one entry per resting order, each entry names the
+  slot where that order is queued, and every entry can be reached by probing
+  from its home slot;
 - the order pool's free list is acyclic, and together with the live slots it
   accounts for every slot ever handed out;
 - every resting order has quantity greater than zero.
@@ -237,6 +290,11 @@ operation plus the edge cases -- zero quantities, duplicate ids across sides,
 price `0` and `UINT64_MAX`, level volume past 2^32, emptying and reusing a
 level, exact level exhaustion, ring capacity boundaries, and each self-trade
 policy.
+
+The building blocks get the same treatment on their own: the node arena, the
+price window, the order pool and the id index. The id index also runs 60,000
+random inserts and deletes on a deliberately small table, compared against
+`std::unordered_map`, with a reachability check after every one.
 
 ### Randomized differential testing
 
@@ -299,8 +357,10 @@ taker used to report `remaining == 0`, indistinguishable from a complete fill.
 
 The price window was checked the same way, with two planted bugs: a best-price
 lookup that ignores the fallback map, and a best-first walk that lists outside
-levels in the wrong place. Both shrink to two or three operations. The order
-pool was checked with two more: a removal that leaves the next order's back link
+levels in the wrong place. Both shrink to two or three operations. The id index
+was checked by deleting without shifting the following entries back, which
+strands any entry that had probed past the gap: the reachability check fails,
+along with one other test. The order pool was checked with two more: a removal that leaves the next order's back link
 stale, and a release that leaks the slot instead of freeing it. Both abort at the
 first invariant check in debug builds; in release, the leak fails five test
 cases, and the stale link sends the match loop round a cycle.
@@ -327,11 +387,13 @@ instrumented too.
 run clean. This matters here because the engine keeps slot indices into its
 order pool and releases slots during matching -- exactly the shape of code that
 produces use-after-free. Two things keep ASan able to see it. The node arena is
-bypassed in this build, so every index and map node goes through ASan's own
-allocator, poisoned and quarantined when freed. The order pool cannot be
-bypassed that way, so it poisons each released slot until it is handed out
-again. The one test that needs the arena, the zero-allocation check, is skipped
-here.
+bypassed in this build, so every map node goes through ASan's own allocator,
+poisoned and quarantined when freed. The order pool cannot be bypassed that
+way, so it poisons each released slot until it is handed out again. The id
+index frees nothing -- its entries are values in one array -- so the debug
+invariant check covers it instead. Two tests are skipped here by design: the
+zero-allocation check, which needs the arena, and the free-list corruption
+test, which writes into a released slot on purpose.
 
 ```sh
 cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug -DLOB_SANITIZER=address
@@ -375,9 +437,10 @@ cmake --build build-rel -j
 Options: `--ops`, `--warmup`, `--runs`, `--seed`, `--depth`, `--cpu` or
 `--no-pin`, `--prefault`, `--system-alloc`, `--price-levels`, and `--dump`,
 which writes every sample -- engine and noise floor -- as `run,index,kind,ns`.
-`--system-alloc` puts the index and map nodes back on malloc, and
+`--system-alloc` puts the fallback map's nodes back on malloc, and
 `--price-levels 0` switches off the flat price array, so one binary can measure
-either against its absence. Orders always live in the slot pool.
+either against its absence. Orders always live in the slot pool, and ids in the
+flat index.
 
 `tools/plot_latency.py` turns dumps into the two figures below. It needs only
 Python 3:
@@ -500,53 +563,54 @@ flags. A `git worktree` with its own release tree does it.
 ### Results
 
 Ryzen 7 7735HS under WSL2, GCC 15 `-O3`, 5 runs of 2M operations over a book of
-about 5,000 orders, on the order pool, the node arena and the flat price array:
+about 5,000 orders, on the order pool, the flat id index and the flat price array:
 
 ```
 runs (ns over all timed ops; page faults and context switches while timing)
-  run 1  p50 70  p99 291  p99.9 761  p99.99 18,616  max 2,132,806   faults 0  switches 0
-  run 2  p50 70  p99 281  p99.9 711  p99.99 18,736  max 290,580   faults 0  switches 0
-  run 3  p50 60  p99 281  p99.9 751  p99.99 13,396  max 160,138   faults 0  switches 1
-  run 4  p50 70  p99 291  p99.9 751  p99.99 19,888  max 858,463   faults 0  switches 0
-  run 5  p50 70  p99 281  p99.9 701  p99.99 18,586  max 1,661,059   faults 0  switches 0
-  orders       pool never outgrew its 10,000 slots
+  run 1  p50 50  p99 200  p99.9 511  p99.99 17,071  max 471,559   faults 0  switches 0
+  run 2  p50 50  p99 230  p99.9 531  p99.99 14,116  max 762,353   faults 0  switches 1
+  run 3  p50 50  p99 200  p99.9 461  p99.99 2,084  max 220,232   faults 0  switches 0
+  run 4  p50 50  p99 240  p99.9 601  p99.99 13,084  max 1,487,196   faults 0  switches 0
+  run 5  p50 50  p99 210  p99.9 511  p99.99 15,859  max 644,758   faults 0  switches 1
+  orders       pool and id index never outgrew 10,000 orders
   prices       flat array of 4,096 levels from 97,957; 0 levels opened outside it
 
 latency (ns), median of 5 runs
                     count      p50      p99    p99.9   p99.99        max
-  all           2,000,000       70      281      751   18,616    858,463
-  add             999,655       70      180      561   18,135    290,580
-  cancel          799,831       40      150      421   13,466    377,086
-  modify          100,354      110      271      822   22,293     94,983
-  marketable      100,160      130      701    1,773   24,688    107,156
-  (spin)        2,000,000      100      110      190   15,179    575,408
+  all           2,000,000       50      210      511   14,116    644,758
+  add             999,655       50      130      381   13,364    583,152
+  cancel          799,831       50      140      431    2,144    333,899
+  modify          100,354       90      260      701   21,840    189,198
+  marketable      100,160      100      461    1,162   21,659    125,789
+  (spin)        2,000,000       70       80      200   17,271    579,405
 
 spread across runs, (max - min) / median
                                 p50      p99    p99.9   p99.99        max
-  all                          14%       4%       8%      35%       230%
-  add                           0%       6%      12%      37%       259%
-  cancel                       25%      13%      33%     101%       530%
-  modify                        0%       4%      20%      36%       731%
-  marketable                    8%       6%      24%      46%       239%
-  (spin)                       30%       9%      47%      29%      1315%
+  all                           0%      19%      27%     106%       197%
+  add                           0%      23%      32%     111%       234%
+  cancel                        0%      36%      42%     565%       205%
+  modify                       11%      19%      44%      23%       221%
+  marketable                    0%      24%      18%      25%       129%
+  (spin)                        0%      38%      70%     104%       106%
 ```
 
-**p50 through p99.9 are the engine.** The spin row stays at 100-190 ns there,
+**p50 through p99.9 are the engine.** The spin row stays at 70-200 ns there,
 while the operations are several times that.
 
-**p99.99 and max are the machine.** Spinning for 100 ns with no engine involved
-still reaches 15 µs at p99.99, the same range as every operation type. A
+**p99.99 and max are the machine.** Spinning for 70 ns with no engine involved
+still reaches 17 µs at p99.99, the same range as every operation type except
+cancel. A
 standalone check agrees: the count of multi-microsecond spikes grows in
 proportion to the length of the timed window, which is the signature of
 interrupts rather than of anything the code does.
 
 Cancel sits right on the threshold. It is short enough that interrupts land in
 roughly 0.01% of cancels, so cancel's p99.99 swings from session to session. It
-has come in near 2 µs, below the machine's floor, and at the floor itself, 13
-µs here. Neither value is a result.
+has come in near 2 µs, below the machine's floor, as it did here, and at the
+floor itself, 13 µs. Neither value is a result.
 
-**What a result has to beat.** In this session overall p99 moves by 4% between
-runs and per-type p99.9 by up to 33%; in the last session, 19% and 108%. A
+**What a result has to beat.** In this session overall p99 moves by 19% between
+runs and per-type p99.9 by up to 44%. Other sessions have ranged from 4% to 108%. A
 single disturbed run widens either. Read against this table alone, a change is real only when
 it exceeds the spread of the cell it claims to improve, so a 3% gain in cancel
 p99.9 is noise here. Comparing two versions is a different question, answered
@@ -564,20 +628,21 @@ What the engine rows say:
 - **Modify costs more than an add,** because it is a cancel plus an add.
 - **Marketable orders have more than three times an add's p99.** A sweep
   erases several orders and sometimes whole levels. The flat price array barely
-  moved them: their cost is the trades and the list erases, not finding the
-  level.
+  moved them. The flat id index did, because every fill used to free a hash
+  node.
 
 ### Optimization log
 
 One change at a time, each measured against the commit before it with
-`tools/ab_compare.py`: 11 interleaved pairs, the default flow, every operation
-type. Only cells the sign test marks count.
+`tools/ab_compare.py`: at least 11 interleaved pairs, the default flow, every
+operation type. Only cells the sign test marks count.
 
 | Change | p50 | p99 | p99.9 | Where it landed |
 |---|---|---|---|---|
 | Node arena instead of malloc | 100 → 80 | 451 → 321 (−29%) | 1,132 → 812 (−28%) | Every type. Marketable p99 −33%, add −34% |
 | Flat price array instead of `std::map` | 80 → 70 | 301 → 271 (−10%) | 711 → 651, not significant | p99 and p99.9: cancel −33% and −34%, modify −31% and −30%, add −22% and −18%. Marketable unchanged |
 | Order slot pool with 32-bit links instead of `std::list` | 70 → 60 | 261 → 250, not significant | 681 → 641, not significant | add p50 −12% and p99.9 −10%; nothing else significant |
+| Flat id index instead of `std::unordered_map` (15 pairs) | 70 → 50 | 311 → 240 (−23%) | 832 → 581 (−30%) | add and marketable about −30% at p99 and p99.9; cancel within noise. On a 200,000-order book: p99 992 → 561 (−43%), p99.9 2,735 → 1,182 (−57%) |
 
 Each row is its own paired measurement, so a row's "before" need not equal the
 previous row's "after". The machine drifts between sessions, which is why a
@@ -625,6 +690,43 @@ load before it can find the level, where the old locator carried price and
 side. Storing price and side beside the slot index took that load off the path,
 at no memory cost, and changed nothing. So the index stays slot-only.
 
+The flat id index is the biggest step so far, and the first to move the deep
+book's tail. The default book, 15 pairs:
+
+```
+                                    p50                         p99                       p99.9
+all              70 ->    50  -29% 13/15*     311 ->   240  -23% 14/15*     832 ->   581  -30% 14/15*
+add              70 ->    50  -29% 14/15*     200 ->   140  -30% 14/15*     591 ->   401  -32% 15/15*
+cancel           40 ->    50  +25%  2/15      190 ->   180   -5%  8/15      601 ->   551   -8% 13/15*
+modify          110 ->    90  -18% 13/15*     321 ->   301   -6% 10/15      942 ->   852  -10% 11/15 
+marketable      130 ->   100  -23% 14/15*     802 ->   561  -30% 14/15*   1,914 -> 1,353  -29% 14/15*
+```
+
+And 200,000 resting orders, 9 pairs:
+
+```
+                                    p50                         p99                       p99.9
+all              70 ->    50  -29%  9/9*     992 ->   561  -43%  9/9*   2,735 -> 1,182  -57%  9/9*
+add              70 ->    50  -29%  9/9*     381 ->   190  -50%  9/9*     731 ->   451  -38%  9/9*
+cancel           50 ->    40  -20%  6/9      832 ->   531  -36%  9/9*   1,733 -> 1,112  -36%  9/9*
+modify          110 ->    90  -18%  9/9*   1,062 ->   711  -33%  9/9*   2,314 -> 1,583  -32%  8/9*
+marketable      301 ->   180  -40%  9/9*   3,016 -> 1,172  -61%  9/9*   6,713 -> 2,304  -66%  9/9*
+```
+
+Both chained-table hops are gone, and so is the node allocated per add and
+freed per cancel or fill. Marketable orders gain the most, because every fill
+used to free a hash node. Cancel gains least, and its p50 is a clock step worse
+on the default book: an erase scans the run of newer entries after it, which
+the old chained table never had to do.
+
+The first version of this change is worth recording too. It hashed with a
+multiply that scatters sequential ids across the table. On the default book it
+looked excellent: all p99 −29%, cancel p99 −50%. On the deep book it more than
+doubled p50 for all operations (70 → 160 ns) and for adds (70 → 180 ns). The
+table there is 16 MiB, and a scattered add touches a cold line every time. A
+locality-preserving hash fixed the deep book and kept most of the default
+book's gain. Without the deep run, the regression would have shipped.
+
 ### Before and after: the allocation tail
 
 The same binary, the same flow and the same seed, with container nodes on malloc
@@ -657,11 +759,11 @@ run-to-run spread are counted as results:
 
 The allocator was not the whole tail, and neither was the price map or the list
 nodes. At `--depth 200000`, where the working set outgrows the caches, the flat
-array trimmed p99 from 982 to 912 ns and the order pool left it there. The
-tail stays near 1 µs. Every operation still makes two dependent hops through
-the id index: bucket array to node, then node to slot. A flat, open-addressed
-id index is the next target, and this benchmark is how to tell whether it
-works.
+array trimmed p99 from 982 to 912 ns, and the order pool left it there. The
+flat id index finally moved it, to 561 ns, by removing the chained table's two
+dependent hops per lookup. What remains is layout: a 40-byte order slot where
+32 bytes would do, and 24-byte price levels where 16 would. Those are the next
+passes, and this benchmark is how to tell whether they work.
 
 ## Build
 

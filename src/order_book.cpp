@@ -25,18 +25,17 @@ namespace {
     constexpr bool kArenaAllowed = true;
 #endif
 
-    //Arena bytes one resting order can need: its hash-map node, and a map node
-    //in case it opens a level outside the price window. The order itself lives
-    //in the slot pool. Node layouts are the standard library's business, so
-    //this assumes a payload plus its links and rounds up to the arena's
-    //granule; provisioning only has to be generous.
+    //Arena bytes one resting order can need: a map node in case it opens a
+    //level outside the price window. The order lives in the slot pool and its
+    //id in the flat index, so this is the only per-order node left. Node
+    //layouts are the standard library's business, so this assumes a payload
+    //plus its links and rounds up to the arena's granule; provisioning only
+    //has to be generous.
     constexpr std::size_t node_bytes(std::size_t payload, std::size_t links) {
         const std::size_t raw = payload + links * sizeof(void*);
         return (raw + NodeArena::kGranule - 1) / NodeArena::kGranule * NodeArena::kGranule;
     }
-    constexpr std::size_t kBytesPerOrder =
-        node_bytes(sizeof(std::pair<const OrderId, SlotIndex>), 2) +
-        node_bytes(sizeof(std::pair<const Price, PriceLevel>), 4);
+    constexpr std::size_t kBytesPerOrder = node_bytes(sizeof(std::pair<const Price, PriceLevel>), 4);
 
     constexpr std::size_t kDefaultPoolSlots = 1024;
 
@@ -131,9 +130,8 @@ OrderBook::OrderBook(Config cfg)
       pool(cfg.expected_orders > 0 ? cfg.expected_orders : kDefaultPoolSlots),
       bids(cfg.price_levels, arena.get()),
       asks(cfg.price_levels, arena.get()),
-      order_index(ArenaAllocator<SlotIndex>(arena.get())),
+      order_index(cfg.expected_orders > 0 ? cfg.expected_orders : kDefaultPoolSlots),
       trade_out(cfg.trade_capacity), policy(cfg.self_trade) {
-    if (cfg.expected_orders > 0) order_index.reserve(cfg.expected_orders);
     if (cfg.price_base) {
         bids.place(*cfg.price_base);
         asks.place(*cfg.price_base);
@@ -240,7 +238,7 @@ void OrderBook::insert(BookSide& book, const Order& order) {
     const SlotIndex slot = pool.acquire();
     pool[slot].value = order;
     append(level, slot);
-    order_index[order.id] = slot;
+    order_index.insert(order.id, slot);
 }
 
 template <typename BookSide>
@@ -259,7 +257,7 @@ ExecReport OrderBook::submit(OrderId id, ParticipantId owner, Side side,
     //A zero-quantity order is a client bug, not a no-op: reject it so the
     //caller finds out, rather than silently accepting an order that can
     //never trade and never rests.
-    if (qty == 0 || order_index.count(id)) {    //Ids must be unique while live
+    if (qty == 0 || order_index.contains(id)) { //Ids must be unique while live
         rep.accepted = false;
         rep.remaining = qty;
         return rep;
@@ -301,11 +299,9 @@ ExecReport OrderBook::add_market(OrderId id, Side side, Quantity qty) {
 }
 
 bool OrderBook::cancel(OrderId id) {
-    auto it = order_index.find(id);
-    if (it == order_index.end()) return false;
+    SlotIndex slot;
+    if (!order_index.take(id, slot)) return false;
 
-    const SlotIndex slot = it->second;
-    order_index.erase(it);
     if (pool[slot].value.side == Side::Buy) remove(bids, slot);
     else                                    remove(asks, slot);
     check_invariants();
@@ -314,15 +310,15 @@ bool OrderBook::cancel(OrderId id) {
 
 ExecReport OrderBook::modify(OrderId id, Price new_price, Quantity new_qty) {
     ExecReport rep;
-    auto it = order_index.find(id);
-    if (it == order_index.end()) {      //Nothing to modify
+    const SlotIndex* slot = order_index.find(id);
+    if (!slot) {                        //Nothing to modify
         rep.accepted = false;
         rep.remaining = new_qty;
         return rep;
     }
 
-    const Side side = pool[it->second].value.side;
-    const ParticipantId owner = pool[it->second].value.owner;
+    const Side side = pool[*slot].value.side;
+    const ParticipantId owner = pool[*slot].value.owner;
     cancel(id);
     if (new_qty == 0) return rep;       //Modify to zero is just a cancel
 
@@ -346,9 +342,8 @@ std::size_t OrderBook::order_count_at(Side side, Price price) const {
 }
 
 const Order* OrderBook::find(OrderId id) const {
-    auto it = order_index.find(id);
-    if (it == order_index.end()) return nullptr;
-    return &pool[it->second].value;
+    const SlotIndex* slot = order_index.find(id);
+    return slot ? &pool[*slot].value : nullptr;
 }
 
 //--- invariants --------------------------------------------------------------
@@ -374,9 +369,9 @@ void OrderBook::check_side(const BookSide& book, Side side, std::size_t& counted
             prev = i;
 
             //The index points at this exact slot.
-            auto it = order_index.find(o.id);
-            assert(it != order_index.end() && "resting order missing from the index");
-            assert(it->second == i && "index points at a different slot");
+            const SlotIndex* indexed = order_index.find(o.id);
+            assert(indexed && "resting order missing from the index");
+            assert(*indexed == i && "index points at a different slot");
         }
         assert(prev == level.tail && "level's tail is not its last order");
         assert(in_queue == level.count && "level's count != orders in its queue");
@@ -393,6 +388,7 @@ void OrderBook::check_invariants() const {
     assert(counted == order_index.size() && "index size != number of resting orders");
     assert(pool.size() == counted && "pool holds slots that no queue reaches");
     assert(pool.consistent() && "order pool free list is corrupt");
+    assert(order_index.consistent() && "id index has an entry its probe cannot reach");
 
     const auto bid = bids.best_price();
     const auto ask = asks.best_price();
