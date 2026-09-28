@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cassert>
 #include <limits>
+#include <stdexcept>
 
 namespace lob {
 
@@ -163,7 +164,7 @@ void OrderBook::match(BookSide& opposite, Order& incoming,
         PriceLevel& level = *best;
         while (incoming.qty > 0 && !level.empty()) {
             const SlotIndex slot = level.head;          //Oldest wins
-            Order& resting = pool[slot].value;
+            RestingOrder& resting = pool[slot].value;
 
             const bool self_trade = policy != SelfTradePolicy::Allow &&
                                     incoming.owner != kAnonymous &&
@@ -236,9 +237,10 @@ void OrderBook::insert(BookSide& book, const Order& order) {
     if (!book.placed()) place_windows(order.price);     //First order to rest
     PriceLevel& level = book.open(order.price);
     const SlotIndex slot = pool.acquire();
-    pool[slot].value = order;
+    if (slot >= (SlotIndex{1} << 31)) throw std::length_error("OrderBook: over 2^31 resting orders");
+    pool[slot].value = RestingOrder{order.id, order.price, order.qty, order.owner};
     append(level, slot);
-    order_index.insert(order.id, slot);
+    order_index.insert(order.id, index_value(slot, order.side));
 }
 
 template <typename BookSide>
@@ -299,26 +301,26 @@ ExecReport OrderBook::add_market(OrderId id, Side side, Quantity qty) {
 }
 
 bool OrderBook::cancel(OrderId id) {
-    SlotIndex slot;
-    if (!order_index.take(id, slot)) return false;
+    std::uint32_t entry;
+    if (!order_index.take(id, entry)) return false;
 
-    if (pool[slot].value.side == Side::Buy) remove(bids, slot);
-    else                                    remove(asks, slot);
+    if (side_of(entry) == Side::Buy) remove(bids, slot_of(entry));
+    else                             remove(asks, slot_of(entry));
     check_invariants();
     return true;
 }
 
 ExecReport OrderBook::modify(OrderId id, Price new_price, Quantity new_qty) {
     ExecReport rep;
-    const SlotIndex* slot = order_index.find(id);
-    if (!slot) {                        //Nothing to modify
+    const std::uint32_t* entry = order_index.find(id);
+    if (!entry) {                       //Nothing to modify
         rep.accepted = false;
         rep.remaining = new_qty;
         return rep;
     }
 
-    const Side side = pool[*slot].value.side;
-    const ParticipantId owner = pool[*slot].value.owner;
+    const Side side = side_of(*entry);
+    const ParticipantId owner = pool[slot_of(*entry)].value.owner;
     cancel(id);
     if (new_qty == 0) return rep;       //Modify to zero is just a cancel
 
@@ -341,9 +343,11 @@ std::size_t OrderBook::order_count_at(Side side, Price price) const {
     return level ? level->count : 0;
 }
 
-const Order* OrderBook::find(OrderId id) const {
-    const SlotIndex* slot = order_index.find(id);
-    return slot ? &pool[*slot].value : nullptr;
+std::optional<Order> OrderBook::find(OrderId id) const {
+    const std::uint32_t* entry = order_index.find(id);
+    if (!entry) return std::nullopt;
+    const RestingOrder& r = pool[slot_of(*entry)].value;
+    return Order{r.id, r.owner, r.price, r.qty, side_of(*entry)};
 }
 
 //--- invariants --------------------------------------------------------------
@@ -359,19 +363,19 @@ void OrderBook::check_side(const BookSide& book, Side side, std::size_t& counted
         std::size_t in_queue = 0;
         SlotIndex prev = kNoSlot;
         for (SlotIndex i = level.head; i != kNoSlot; i = pool[i].next) {
-            const Order& o = pool[i].value;
+            const RestingOrder& o = pool[i].value;
             assert(pool[i].prev == prev && "queue's back link disagrees with its forward link");
             assert(o.price == price && "order filed under the wrong price");
-            assert(o.side == side && "order filed on the wrong side");
             assert(o.qty > 0 && "fully filled order still resting");
             sum += o.qty;
             ++in_queue;
             prev = i;
 
             //The index points at this exact slot.
-            const SlotIndex* indexed = order_index.find(o.id);
+            const std::uint32_t* indexed = order_index.find(o.id);
             assert(indexed && "resting order missing from the index");
-            assert(*indexed == i && "index points at a different slot");
+            assert(slot_of(*indexed) == i && "index points at a different slot");
+            assert(side_of(*indexed) == side && "index files the order on the wrong side");
         }
         assert(prev == level.tail && "level's tail is not its last order");
         assert(in_queue == level.count && "level's count != orders in its queue");

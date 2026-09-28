@@ -110,10 +110,10 @@ checker covers the window as well:
 
 ### Orders live in a slot pool, linked by 32-bit index
 
-Every resting order occupies one 40-byte slot in a `SlotPool`: a single
+Every resting order occupies one 32-byte slot in a `SlotPool`: a single
 contiguous block, allocated and touched at construction and sized by
-`Config::expected_orders`. A slot holds the order plus two 32-bit links, and a
-price level's queue is threaded through those links: head, tail and count, 24
+`Config::expected_orders`. A slot holds the order's hot fields plus two 32-bit
+links, and a price level's queue is threaded through those links: head, tail and count, 24
 bytes a level. Appending, cancelling from the middle, or filling from the front
 is a few index writes. There is no list node and no allocator call, not even
 the arena's free list. Freed slots go on an intrusive free list, LIFO, so the
@@ -121,7 +121,7 @@ slot a cancel frees is the next one an add takes.
 
 | | `std::list` in the arena | Slot pool |
 |---|---|---|
-| Per order | 48-byte list node, anywhere in the arena's slabs | 40-byte slot, contiguous with every other order |
+| Per order | 48-byte list node, anywhere in the arena's slabs | 32-byte slot, two to a cache line (40 bytes before the hot/cold split below) |
 | Id index entry | 24-byte locator (price, side, iterator); 48-byte node | 4-byte slot index; 32-byte node, and now a 16-byte entry in the flat index |
 | Price level | 40 bytes, so 4,096 levels take 160 KiB per side | 24 bytes, so 96 KiB per side |
 | Link | 8-byte pointer | 4-byte index |
@@ -133,12 +133,33 @@ order. They also survive the block moving, which is what makes growth possible:
   itself once. `order_pool_growths()` counts it, and the benchmark reports it:
   never, on its flow. Size `expected_orders` for the peak book and it never
   happens on the matching path.
-- **`find()` pointers are short-lived.** They are valid until the next call that
-  changes the book, since a growth moves every order. The engine holds only
-  indices across calls.
-- **Memory is reserved up front,** 40 bytes a slot, whether used or not.
-- **32-bit indices cap a book** at about 4.29 billion resting orders. Past that
-  the pool throws rather than wrapping.
+- **`find()` returns a copy.** An order's fields live in two places, its slot
+  and its index entry, so there is no stored `Order` to point at. The engine
+  holds only indices across calls, since a growth moves every order.
+- **Memory is reserved up front,** 32 bytes a slot, whether used or not.
+- **Indices cap a book** at 2^31 resting orders, since the index spends one
+  bit on the side. Past that the book throws rather than wrapping.
+
+**Hot and cold.** A slot holds exactly what the matching loop reads: id,
+price, quantity and owner, 24 bytes, plus the two links. That makes 32 bytes,
+aligned to 32 so none straddles a cache line, and `static_assert` holds both.
+
+The guide this follows puts the participant id in a cold array. Here it stays
+hot, because self-trade prevention compares owners for every resting order a
+taker touches. The side is the one field the loop never reads: matching knows
+it from the ladder it walks, and cancel, modify and `find()` reach an order
+through the id index. So the side rides in a spare bit of the index entry,
+which a cancel has already loaded, rather than in a cold array it would have
+to fetch separately. With nothing else cold -- no timestamps, no flags --
+there is no cold array to build. When fields like those arrive, they belong in
+one, indexed by slot.
+
+The split turned up a compiler trap. `SlotPool` first declared its slot with
+three `alignas` specifiers, meaning the strictest wins, and GCC 15 silently kept
+only the last: the "32-byte" slots were 8-aligned, and half of them straddled a
+line. A test that checks real slot addresses caught it; a size check alone would
+not have. The slot now takes a single `alignas` of the explicit maximum, and a
+`static_assert` covers alignment as well as size.
 
 The guide this follows says `std::list` calls `operator new` for every order.
 Here the arena had already taken the system allocator off the hot path, so what
@@ -267,8 +288,8 @@ operation that caused it rather than three operations later. It checks that:
 - each level's queue links agree in both directions, and its tail and count
   match the orders actually in it;
 - the id index holds exactly one entry per resting order, each entry names the
-  slot where that order is queued, and every entry can be reached by probing
-  from its home slot;
+  slot where that order is queued and the side it rests on, and every entry can
+  be reached by probing from its home slot;
 - the order pool's free list is acyclic, and together with the live slots it
   accounts for every slot ever handed out;
 - every resting order has quantity greater than zero.
@@ -567,50 +588,50 @@ about 5,000 orders, on the order pool, the flat id index and the flat price arra
 
 ```
 runs (ns over all timed ops; page faults and context switches while timing)
-  run 1  p50 50  p99 200  p99.9 511  p99.99 17,071  max 471,559   faults 0  switches 0
-  run 2  p50 50  p99 230  p99.9 531  p99.99 14,116  max 762,353   faults 0  switches 1
-  run 3  p50 50  p99 200  p99.9 461  p99.99 2,084  max 220,232   faults 0  switches 0
-  run 4  p50 50  p99 240  p99.9 601  p99.99 13,084  max 1,487,196   faults 0  switches 0
-  run 5  p50 50  p99 210  p99.9 511  p99.99 15,859  max 644,758   faults 0  switches 1
+  run 1  p50 50  p99 210  p99.9 571  p99.99 13,494  max 459,023   faults 0  switches 0
+  run 2  p50 50  p99 190  p99.9 541  p99.99 2,014  max 405,921   faults 0  switches 1
+  run 3  p50 50  p99 210  p99.9 581  p99.99 7,744  max 696,402   faults 0  switches 0
+  run 4  p50 50  p99 210  p99.9 531  p99.99 12,232  max 222,809   faults 0  switches 0
+  run 5  p50 50  p99 200  p99.9 591  p99.99 2,595  max 304,142   faults 0  switches 1
   orders       pool and id index never outgrew 10,000 orders
   prices       flat array of 4,096 levels from 97,957; 0 levels opened outside it
 
 latency (ns), median of 5 runs
                     count      p50      p99    p99.9   p99.99        max
-  all           2,000,000       50      210      511   14,116    644,758
-  add             999,655       50      130      381   13,364    583,152
-  cancel          799,831       50      140      431    2,144    333,899
-  modify          100,354       90      260      701   21,840    189,198
-  marketable      100,160      100      461    1,162   21,659    125,789
-  (spin)        2,000,000       70       80      200   17,271    579,405
+  all           2,000,000       50      210      571    7,744    405,921
+  add             999,655       50      140      401    1,994    136,992
+  cancel          799,831       40      140      551    1,803    304,142
+  modify          100,354       90      270      862   18,603    132,117
+  marketable      100,160       90      461    1,172   21,288     89,971
+  (spin)        2,000,000       70       90      120   12,502    193,266
 
 spread across runs, (max - min) / median
                                 p50      p99    p99.9   p99.99        max
-  all                           0%      19%      27%     106%       197%
-  add                           0%      23%      32%     111%       234%
-  cancel                        0%      36%      42%     565%       205%
-  modify                       11%      19%      44%      23%       221%
-  marketable                    0%      24%      18%      25%       129%
-  (spin)                        0%      38%      70%     104%       106%
+  all                           0%      10%      11%     148%       117%
+  add                           0%      14%      15%     587%       257%
+  cancel                        0%      21%      22%     167%       175%
+  modify                        0%      11%      22%      44%       119%
+  marketable                   11%       9%      15%      21%        54%
+  (spin)                        0%      22%      67%     114%       390%
 ```
 
-**p50 through p99.9 are the engine.** The spin row stays at 70-200 ns there,
+**p50 through p99.9 are the engine.** The spin row stays at 70-120 ns there,
 while the operations are several times that.
 
 **p99.99 and max are the machine.** Spinning for 70 ns with no engine involved
-still reaches 17 µs at p99.99, the same range as every operation type except
-cancel. A
+still reaches 12 µs at p99.99. Modify and marketable sit in the same range. A
 standalone check agrees: the count of multi-microsecond spikes grows in
 proportion to the length of the timed window, which is the signature of
 interrupts rather than of anything the code does.
 
-Cancel sits right on the threshold. It is short enough that interrupts land in
-roughly 0.01% of cancels, so cancel's p99.99 swings from session to session. It
-has come in near 2 µs, below the machine's floor, as it did here, and at the
-floor itself, 13 µs. Neither value is a result.
+Add and cancel now sit right on the threshold. They are short enough that
+interrupts land in roughly 0.01% of them, so their p99.99 swings from session to
+session. It comes in near 2 µs, below the machine's floor, as both did here, or
+at the floor itself, above 10 µs. Neither value is a result, and the overall
+p99.99 inherits the swing.
 
-**What a result has to beat.** In this session overall p99 moves by 19% between
-runs and per-type p99.9 by up to 44%. Other sessions have ranged from 4% to 108%. A
+**What a result has to beat.** In this session overall p99 moves by 10% between
+runs and per-type p99.9 by up to 22%. Other sessions have ranged from 4% to 108%. A
 single disturbed run widens either. Read against this table alone, a change is real only when
 it exceeds the spread of the cell it claims to improve, so a 3% gain in cancel
 p99.9 is noise here. Comparing two versions is a different question, answered
@@ -643,6 +664,7 @@ operation type. Only cells the sign test marks count.
 | Flat price array instead of `std::map` | 80 → 70 | 301 → 271 (−10%) | 711 → 651, not significant | p99 and p99.9: cancel −33% and −34%, modify −31% and −30%, add −22% and −18%. Marketable unchanged |
 | Order slot pool with 32-bit links instead of `std::list` | 70 → 60 | 261 → 250, not significant | 681 → 641, not significant | add p50 −12% and p99.9 −10%; nothing else significant |
 | Flat id index instead of `std::unordered_map` (15 pairs) | 70 → 50 | 311 → 240 (−23%) | 832 → 581 (−30%) | add and marketable about −30% at p99 and p99.9; cancel within noise. On a 200,000-order book: p99 992 → 561 (−43%), p99.9 2,735 → 1,182 (−57%) |
+| 32-byte hot order slot instead of 40 (15 pairs) | 50 → 50 | 210 → 210, not significant | 611 → 561, not significant | cancel p50 50 → 40; nothing else significant, and no change on a 200,000-order book |
 
 Each row is its own paired measurement, so a row's "before" need not equal the
 previous row's "after". The machine drifts between sessions, which is why a
@@ -726,6 +748,29 @@ doubled p50 for all operations (70 → 160 ns) and for adds (70 → 180 ns). The
 table there is 16 MiB, and a scattered add touches a cold line every time. A
 locality-preserving hash fixed the deep book and kept most of the default
 book's gain. Without the deep run, the regression would have shipped.
+
+The 32-byte hot slot measured almost nothing, 15 pairs on the default book:
+
+```
+                                    p50                         p99                       p99.9
+all              50 ->    50   +0%  0/15      210 ->   210   +0%  5/15      611 ->   561   -8%  8/15 
+add              50 ->    50   +0%  0/15      140 ->   140   +0%  4/15      421 ->   401   -5%  7/15 
+cancel           50 ->    40  -20% 12/15*     150 ->   150   +0%  6/15      571 ->   511  -11%  9/15 
+modify           90 ->    90   +0%  1/15      281 ->   281   +0%  5/15      892 ->   831   -7%  9/15 
+marketable      100 ->   100   +0%  6/15      491 ->   471   -4%  6/15    1,272 -> 1,192   -6%  9/15 
+```
+
+On the 200,000-order book, 9 pairs, no cell moved. There are two reasons:
+
+- **The default book's pool fits in L2 at either slot size.** 10,000 slots are
+  400 KiB at 40 bytes and 320 KiB at 32.
+- **On the deep book, each operation still reads one slot line either way.**
+  The costs that dominate are elsewhere: the index entry, the price level, and,
+  for a sweep, the trades.
+
+The layout is kept anyway: it is smaller, never straddles a line, and building
+it exposed the `alignas` trap described above, which would have quietly
+undermined any later layout work.
 
 ### Before and after: the allocation tail
 

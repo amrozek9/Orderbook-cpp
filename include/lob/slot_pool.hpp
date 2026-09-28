@@ -21,6 +21,7 @@
 // any allocator that recycles memory; the book's invariant checks, which tie
 // every queued slot to the id index, are what catch that.
 //-----------------------------------------------------------------------------
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -46,12 +47,16 @@ namespace lob {
 using SlotIndex = std::uint32_t;
 inline constexpr SlotIndex kNoSlot = std::numeric_limits<SlotIndex>::max();
 
-template <typename T>
+//`Align` lets a caller whose slot is a power-of-two size align it to that
+//size, so no slot straddles a cache line.
+template <typename T, std::size_t Align = alignof(T)>
 class SlotPool {
     static_assert(std::is_trivially_copyable_v<T>, "slots are copied when the pool grows");
 
 public:
-    struct Slot {
+    //One alignas with the maximum spelled out: GCC 15 silently kept only the
+    //last of several alignas specifiers here, leaving 32-byte slots 8-aligned.
+    struct alignas(std::max({Align, alignof(T), alignof(SlotIndex)})) Slot {
         T value;
         SlotIndex prev = kNoSlot;       //Queue links while in use...
         SlotIndex next = kNoSlot;       //...and the free-list link while free

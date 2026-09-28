@@ -91,6 +91,18 @@ TEST_CASE("pool: consistent() catches a free list that loops") {
     pool[a].next = kNoSlot;             //Restore, so teardown sees a sane list
 }
 
+TEST_CASE("pool: an aligned pool never lets a slot straddle a cache line") {
+    struct Payload {std::uint64_t a, b, c;};            //24 bytes, like the book's orders
+    SlotPool<Payload, 32> pool(3);
+    for (int k = 0; k < 40; ++k) {                      //Through two growths
+        const SlotIndex i = pool.acquire();
+        const auto addr = reinterpret_cast<std::uintptr_t>(&pool[i]);
+        CHECK(addr % 32 == 0);
+        CHECK(addr / 64 == (addr + sizeof(pool[i]) - 1) / 64);
+    }
+    CHECK(sizeof(SlotPool<Payload, 32>::Slot) == 32);
+}
+
 TEST_CASE("pool: a zero capacity still yields a usable pool") {
     SlotPool<int> pool(0);
     CHECK(pool.capacity() == 1);
@@ -118,17 +130,17 @@ TEST_CASE("book: an outgrown order pool grows and loses nothing") {
     CHECK(book.order_pool_growths() > 0);
     CHECK(book.size() == 40);
     for (lob::OrderId id = 1; id <= 40; ++id) {
-        const lob::Order* o = book.find(id);
-        REQUIRE(o != nullptr);
+        const auto o = book.find(id);
+        REQUIRE(o);
         CHECK(o->qty == id);
     }
     //Time priority survives the moves: the best bid, 1000, holds ids 5, 10,
     //15, ... in arrival order, so selling 5 + 10 takes exactly the first two.
     const auto rep = book.add_market(100, lob::Side::Sell, 5 + 10);
     CHECK(rep.filled == 15);
-    CHECK(book.find(5) == nullptr);
-    CHECK(book.find(10) == nullptr);
-    CHECK(book.find(15) != nullptr);
+    CHECK_FALSE(book.find(5));
+    CHECK_FALSE(book.find(10));
+    CHECK(book.find(15));
 }
 
 TEST_CASE("book: churn reuses freed order slots instead of growing") {

@@ -64,7 +64,7 @@ public:
     }
 
     void sweep(const lob::OrderBook& book) {
-        std::erase_if(ids, [&](lob::OrderId id) {return book.find(id) == nullptr;});
+        std::erase_if(ids, [&](lob::OrderId id) {return !book.find(id);});
     }
 
 private:

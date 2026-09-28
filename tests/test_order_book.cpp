@@ -73,7 +73,7 @@ TEST_CASE("Cancel by id") {
     REQUIRE(book.qty_at(Side::Buy, 100) == 7);
     REQUIRE(book.order_count_at(Side::Buy, 100) == 1);
     REQUIRE(book.best_bid() == 100);
-    REQUIRE(book.find(1) == nullptr);
+    REQUIRE_FALSE(book.find(1));
 
     REQUIRE_FALSE(book.cancel(1));      //Already gone
     REQUIRE_FALSE(book.cancel(99));     //Never existed
@@ -269,7 +269,7 @@ TEST_CASE("Market order that exhausts the book drops the remainder") {
 
     REQUIRE(book.empty());
     REQUIRE_FALSE(book.best_ask().has_value());
-    REQUIRE(book.find(3) == nullptr);
+    REQUIRE_FALSE(book.find(3));
     book.check_invariants();
 }
 
@@ -348,7 +348,7 @@ TEST_CASE("Modify preserves the owner for self-trade purposes") {
     auto rep = book.modify(2, 101, 5);      //Would be a wash trade
     REQUIRE(rep.trade_count == 0);
     REQUIRE(rep.stp_cancelled == 5);
-    REQUIRE(book.find(1) == nullptr);       //Resting side was cancelled
+    REQUIRE_FALSE(book.find(1));       //Resting side was cancelled
 }
 
 TEST_CASE("Modify to zero quantity is a cancel, and unknown ids are rejected") {
@@ -505,7 +505,7 @@ TEST_CASE("CancelResting kills the maker and lets the taker keep walking") {
     REQUIRE(fills.size() == 2);
     for (const Trade& t : fills) REQUIRE(t.maker_id != 1);
 
-    REQUIRE(book.find(1) == nullptr);
+    REQUIRE_FALSE(book.find(1));
     REQUIRE(book.best_bid() == 101);            //Leftover rested
     book.check_invariants();
 }
@@ -522,7 +522,7 @@ TEST_CASE("CancelIncoming stops the taker and leaves the book untouched") {
     REQUIRE(rep.remaining == 7);                //Cancelled, and reported as such
     REQUIRE_FALSE(rep.rested);                  //remaining>0 + !rested == dropped
 
-    REQUIRE(book.find(2) != nullptr);           //Maker survives untouched
+    REQUIRE(book.find(2));           //Maker survives untouched
     REQUIRE(book.qty_at(Side::Sell, 101) == 5);
     REQUIRE_FALSE(book.best_bid().has_value());
     book.check_invariants();

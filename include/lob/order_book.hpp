@@ -59,6 +59,8 @@ namespace lob {
         CancelIncoming      //Stop the taker dead, drop its remainder, book untouched
     };
 
+    //An order as the API reports it. The book does not store this struct:
+    //see RestingOrder.
     struct Order {
         OrderId id;
         ParticipantId owner;
@@ -66,6 +68,23 @@ namespace lob {
         Quantity qty;
         Side side;
     };
+
+    //What the book keeps per resting order: exactly what the matching loop
+    //reads, and nothing else. 24 bytes, so with its two queue links a pool
+    //slot is 32 -- two to a cache line, aligned so none straddles one.
+    //
+    //The owner stays hot because self-trade prevention compares it for every
+    //resting order a taker touches. The side is the one field the loop never
+    //reads: matching knows it from the ladder it walks, and cancel, modify and
+    //find() reach an order through the id index, which carries the side in a
+    //spare bit. No cold array is needed, because nothing is left to put in it.
+    struct RestingOrder {
+        OrderId id;
+        Price price;
+        Quantity qty;
+        ParticipantId owner;
+    };
+    static_assert(sizeof(RestingOrder) == 24, "the hot order record grew");
 
     //The resting orders at one price, as a FIFO queue threaded through the
     //book's order pool by slot index: head has time priority, and each slot
@@ -345,9 +364,9 @@ namespace lob {
         std::optional<Price> best_ask() const;
         Volume qty_at(Side side, Price price) const;
         std::size_t order_count_at(Side side, Price price) const;
-        //The resting order, or nullptr. The pointer is valid until the next
-        //call that changes the book: a growing order pool moves its orders.
-        const Order* find(OrderId id) const;
+        //A copy of the resting order, or nothing. By value, because the book
+        //keeps an order's fields in two places (its slot and its index entry).
+        std::optional<Order> find(OrderId id) const;
 
         std::size_t size() const {return order_index.size();}
         bool empty() const {return order_index.size() == 0;}
@@ -358,12 +377,16 @@ namespace lob {
         //publishing a book snapshot, and for asserting queue order in tests.
         template <typename F>
         void for_each_resting(F&& fn) const {
-            const auto visit = [&](Price, const PriceLevel& level) {
-                for (SlotIndex i = level.head; i != kNoSlot; i = pool[i].next)
-                    fn(pool[i].value);
+            const auto visit = [&](Side side) {
+                return [&, side](Price, const PriceLevel& level) {
+                    for (SlotIndex i = level.head; i != kNoSlot; i = pool[i].next) {
+                        const RestingOrder& r = pool[i].value;
+                        fn(Order{r.id, r.owner, r.price, r.qty, side});
+                    }
+                };
             };
-            bids.for_each_level(visit);
-            asks.for_each_level(visit);
+            bids.for_each_level(visit(Side::Buy));
+            asks.for_each_level(visit(Side::Sell));
         }
 
         //--- price window ----------------------------------------------
@@ -395,11 +418,23 @@ namespace lob {
         std::uint64_t id_index_growths() const {return order_index.growths();}
 
     private:
+        using OrderSlots = SlotPool<RestingOrder, 32>;
+        static_assert(sizeof(OrderSlots::Slot) == 32, "an order slot must fill half a cache line");
+        static_assert(alignof(OrderSlots::Slot) == 32, "an order slot must never straddle a cache line");
+
+        //An index entry's value: the order's slot, shifted up one bit, with
+        //the side in bit 0. Caps a book at 2^31 resting orders.
+        static std::uint32_t index_value(SlotIndex slot, Side side) {
+            return slot << 1 | (side == Side::Sell ? 1u : 0u);
+        }
+        static SlotIndex slot_of(std::uint32_t value) {return value >> 1;}
+        static Side side_of(std::uint32_t value) {return value & 1 ? Side::Sell : Side::Buy;}
+
         std::unique_ptr<NodeArena> arena;       //Null: system allocator. Outlives the containers
-        SlotPool<Order> pool;                   //Every resting order, and its queue links
+        OrderSlots pool;                        //Every resting order, and its queue links
         PriceLadder<true> bids;
         PriceLadder<false> asks;
-        IdIndex<SlotIndex> order_index;         //OrderId -> its slot in the pool
+        IdIndex<std::uint32_t> order_index;     //OrderId -> slot and side
 
         TradeRing trade_out;
         SelfTradePolicy policy;
