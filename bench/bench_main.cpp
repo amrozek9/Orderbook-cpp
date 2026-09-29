@@ -267,6 +267,29 @@ std::size_t prefault_heap(std::size_t mib) {
 #endif
 }
 
+//Transparent huge page mode, the bracketed word in the kernel's setting.
+std::string thp_mode() {
+    const std::string line = read_line("/sys/kernel/mm/transparent_hugepage/enabled");
+    const auto open = line.find('['), close = line.find(']');
+    return open == std::string::npos || close == std::string::npos
+         ? "unavailable" : line.substr(open + 1, close - open - 1);
+}
+
+//KiB of this process's anonymous memory currently backed by huge pages.
+long anon_huge_kib() {
+    std::ifstream in("/proc/self/smaps_rollup");
+    std::string key;
+    long kib = 0;
+    while (in >> key) {
+        if (key == "AnonHugePages:") {
+            in >> kib;
+            return kib;
+        }
+        in.ignore(4096, '\n');
+    }
+    return 0;
+}
+
 struct Usage {
     long minor_faults = 0;
     long major_faults = 0;
@@ -330,6 +353,7 @@ struct RunResult {
     std::uint64_t opened_outside = 0;           //Levels that fell back to the map
     std::uint64_t pool_growths = 0;             //Times the order pool ran out
     std::uint64_t index_growths = 0;            //Times the id index rehashed
+    long huge_kib = 0;                          //Memory on huge pages while the book lived
 };
 
 class Bench {
@@ -373,6 +397,7 @@ public:
         res.window_base = book.price_window_base();
         res.opened_outside = book.levels_opened_outside_window();
         res.pool_growths = book.order_pool_growths();
+        res.huge_kib = anon_huge_kib();
         res.index_growths = book.id_index_growths();
 
         if (dump) {
@@ -697,6 +722,10 @@ int main(int argc, char** argv) {
         outside = std::max(outside, r.opened_outside);
         growths = std::max(growths, r.pool_growths + r.index_growths);
     }
+    long huge = 0;
+    for (const RunResult& r : results) huge = std::max(huge, r.huge_kib);
+    std::printf("  huge pages   %ld MiB of the book on 2 MiB pages (transparent huge pages: %s)\n",
+                huge / 1024, thp_mode().c_str());
     std::printf("  orders       pool and id index never outgrew %s orders%s\n",
                 grouped(book_cfg.expected_orders).c_str(),
                 growths ? (": WARNING, grew " + std::to_string(growths) + " times").c_str() : "");

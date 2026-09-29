@@ -38,6 +38,8 @@
 #include <type_traits>
 #include <vector>
 
+#include "lob/huge_pages.hpp"
+
 namespace lob {
 
 template <typename Value>
@@ -113,7 +115,7 @@ private:
         bool used;
     };
 
-    std::vector<Entry> table;
+    std::vector<Entry, HugePageAllocator<Entry>> table; //Huge pages once past 2 MiB
     std::size_t mask = 0;
     unsigned shift = 0;             //64 - log2(capacity)
     std::size_t count = 0;
@@ -153,7 +155,7 @@ private:
 
     void grow() {
         if (table.size() > (std::size_t{1} << 62)) throw std::length_error("IdIndex: table too large");
-        std::vector<Entry> old;
+        std::vector<Entry, HugePageAllocator<Entry>> old;
         old.swap(table);
         resize_table(old.size() * 2);
         for (const Entry& e : old)

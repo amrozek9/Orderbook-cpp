@@ -9,6 +9,7 @@
 #include <utility>
 #include <vector>
 
+#include "lob/huge_pages.hpp"
 #include "lob/id_index.hpp"
 #include "lob/node_arena.hpp"
 #include "lob/slot_pool.hpp"
@@ -240,7 +241,7 @@ namespace lob {
             return i;
         }
 
-        std::vector<PriceLevel> window;         //Allocated up front; empty slots are absent levels
+        std::vector<PriceLevel, HugePageAllocator<PriceLevel>> window; //Up front; empty slots are absent levels
         Overflow overflow;                      //Levels outside the window, best first
         Price lo = 0;                           //Window base
         std::size_t limit = 0;                  //Levels in use; 0 until placed

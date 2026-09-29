@@ -231,6 +231,30 @@ The tradeoffs:
 With orders in the pool and ids in the flat table, nothing per order is a node
 any more. The arena below now serves only levels outside the price window.
 
+### Big arrays ask for huge pages
+
+On a deep book the order pool and the id index are each over 10 MiB, and a
+random access into 16 MiB of 4 KiB pages lands on one of 4,096 pages, more than
+the second-level TLB holds. So a lookup can miss the TLB as well as the cache.
+The pool, the index and the price window allocate through `HugePageAllocator`:
+
+- **Blocks of 2 MiB or more are mapped fresh** with `mmap`, trimmed to a 2 MiB
+  boundary, and marked `MADV_HUGEPAGE`. The kernel then backs them with 2 MiB
+  pages from the first touch. Going through malloc would risk heap memory that
+  is already faulted in as small pages, which the advice cannot change after
+  the fact, and the benchmark's heap pre-fault makes that likely.
+- **Smaller blocks take `std::allocator`'s own path, exactly.** A first version
+  used aligned `new` for them too, and even a book with no huge pages then
+  measured a clock step slower on cancel p50. Allocation placement alone moved
+  it.
+- **It is advice.** With transparent huge pages set to `never`, or no huge page
+  free, the memory is ordinary pages and everything still works. The benchmark
+  reports what the kernel actually did, read from `/proc/self/smaps_rollup`: 30
+  MiB of the 200,000-order book on 2 MiB pages, and none of the default book,
+  whose arrays are all under 2 MiB.
+- **Rounding up can waste up to 2 MiB per array,** which is noise beside the
+  arrays that qualify.
+
 ### Fallback map nodes come from a per-book arena
 
 Before the order pool and the flat id index, every resting order cost a
@@ -314,7 +338,7 @@ level, exact level exhaustion, ring capacity boundaries, and each self-trade
 policy.
 
 The building blocks get the same treatment on their own: the node arena, the
-price window, the order pool and the id index. The id index also runs 60,000
+price window, the order pool, the id index and the huge-page allocator. The id index also runs 60,000
 random inserts and deletes on a deliberately small table, compared against
 `std::unordered_map`, with a reachability check after every one.
 
@@ -589,51 +613,51 @@ about 5,000 orders, on the order pool, the flat id index and the flat price arra
 
 ```
 runs (ns over all timed ops; page faults and context switches while timing)
-  run 1  p50 50  p99 230  p99.9 491  p99.99 21,201  max 492,311   faults 0  switches 1
-  run 2  p50 50  p99 210  p99.9 431  p99.99 12,344  max 173,817   faults 0  switches 0
-  run 3  p50 50  p99 261  p99.9 551  p99.99 22,955  max 453,870   faults 0  switches 0
-  run 4  p50 50  p99 200  p99.9 421  p99.99 13,196  max 714,385   faults 0  switches 0
-  run 5  p50 50  p99 220  p99.9 471  p99.99 17,704  max 283,781   faults 0  switches 1
+  run 1  p50 50  p99 230  p99.9 671  p99.99 2,194  max 126,663   faults 0  switches 0
+  run 2  p50 50  p99 220  p99.9 541  p99.99 2,635  max 1,998,215   faults 0  switches 0
+  run 3  p50 50  p99 301  p99.9 681  p99.99 25,377  max 9,036,513   faults 0  switches 1
+  run 4  p50 50  p99 220  p99.9 601  p99.99 2,014  max 142,652   faults 0  switches 0
+  run 5  p50 50  p99 240  p99.9 611  p99.99 19,145  max 1,476,994   faults 0  switches 1
+  huge pages   0 MiB of the book on 2 MiB pages (transparent huge pages: madvise)
   orders       pool and id index never outgrew 10,000 orders
   prices       flat array of 4,096 levels from 97,957; 0 levels opened outside it
 
 latency (ns), median of 5 runs
                     count      p50      p99    p99.9   p99.99        max
-  all           2,000,000       50      220      471   17,704    453,870
-  add             999,655       50      130      331   17,173    175,574
-  cancel          799,831       40      170      381   12,975    283,781
-  modify          100,354       90      281      511   24,868    105,344
-  marketable      100,160      100      491      892   28,415    257,389
-  (spin)        2,000,000       70       90      200   16,161  1,233,365
+  all           2,000,000       50      230      611    2,635  1,476,994
+  add             999,655       50      140      401    1,292  1,110,554
+  cancel          799,831       50      170      561    2,204    519,708
+  modify          100,354       90      301      832   19,085     69,808
+  marketable      100,160      100      551    1,373   31,127    153,712
+  (spin)        2,000,000       70      100      230   16,891    769,794
 
 spread across runs, (max - min) / median
                                 p50      p99    p99.9   p99.99        max
-  all                           0%      27%      28%      60%       119%
-  add                           0%      23%      21%     123%       160%
-  cancel                       25%      41%      37%     150%       219%
-  modify                       11%      25%      22%      33%       156%
-  marketable                   20%      33%      36%      66%        89%
-  (spin)                        0%      22%      60%      36%       160%
+  all                           0%      35%      23%     887%       603%
+  add                           0%      29%      25%    1541%       805%
+  cancel                       20%      59%      30%    1190%       176%
+  modify                       11%      37%      34%     194%        97%
+  marketable                   20%      33%      24%      81%       933%
+  (spin)                       14%      30%     109%     152%      1182%
 ```
 
-**p50 through p99.9 are the engine.** The spin row stays at 70-200 ns there,
+**p50 through p99.9 are the engine.** The spin row stays at 70-230 ns there,
 while the operations are several times that.
 
 **p99.99 and max are the machine.** Spinning for 70 ns with no engine involved
-still reaches 16 µs at p99.99, the same range as every operation type in this
-run. A
+still reaches 17 µs at p99.99, the same range as modify and marketable. A
 standalone check agrees: the count of multi-microsecond spikes grows in
 proportion to the length of the timed window, which is the signature of
 interrupts rather than of anything the code does.
 
 Add and cancel sit right on the threshold. They are short enough that
 interrupts land in roughly 0.01% of them, so their p99.99 swings from session to
-session. It comes in near 2 µs, below the machine's floor, in some sessions, and
-at the floor itself, above 10 µs, in others, this one included. Neither value is
-a result, and the overall p99.99 inherits the swing.
+session. It comes in near 2 µs, below the machine's floor, in some sessions,
+this one included, and at the floor itself, above 10 µs, in others. Neither
+value is a result, and the overall p99.99 inherits the swing.
 
-**What a result has to beat.** In this session overall p99 moves by 27% between
-runs and per-type p99.9 by up to 37%. Other sessions have ranged from 4% to 108%. A
+**What a result has to beat.** In this session overall p99 moves by 35% between
+runs and per-type p99.9 by up to 34%. Other sessions have ranged from 4% to 108%. A
 single disturbed run widens either. Read against this table alone, a change is real only when
 it exceeds the spread of the cell it claims to improve, so a 3% gain in cancel
 p99.9 is noise here. Comparing two versions is a different question, answered
@@ -671,6 +695,7 @@ operation type. Only cells the sign test marks count.
 | *Rejected:* order path specialized on side (15 pairs) | 50 → 50 | 190 → 190, not significant | 421 → 431, not significant | marketable p50 90 → 100 and p99 401 → 421, both significantly **worse**. Reverted |
 | Profile-guided branch hints (15 pairs) | 50 → 50 | 190 → 190, not significant | 401 → 411, not significant | add p99 −8% and p99.9 −7%; on a 200,000-order book, add p99 −6% and modify p50 −11% |
 | *Rejected:* branchless queue unlink (15 pairs) | 50 → 50 | 220 → 220, not significant | 581 → 571, not significant | modify p50 90 → 80; nothing at 200,000 orders, where p99 leaned slightly worse. Not adopted |
+| Huge pages for blocks of 2 MiB or more (15 pairs) | 50 → 50 | 210 → 210, not significant | 551 → 541, not significant | Nothing on the default book, where no array qualifies. On a 200,000-order book: p99 571 → 511 (−11%), p99.9 1,272 → 1,092 (−14%), cancel p99.9 −31%; modify p50 one step slower |
 
 Each row is its own paired measurement, so a row's "before" need not equal the
 previous row's "after". The machine drifts between sessions, which is why a
@@ -896,6 +921,32 @@ unlinks one of the newest orders, the tail of its queue, and a fill always
 takes the head. The predictor learns that, so the branches were nearly free,
 and the masked version was not adopted.
 
+Huge pages were the last change in this pass, and the only one aimed at the
+deep book. On the 200,000-order book, where 30 MiB of the pool and index sit on
+2 MiB pages, 15 pairs:
+
+```
+                                    p50                         p99                       p99.9
+all              50 ->    50   +0%  0/15      571 ->   511  -11% 15/15*   1,272 -> 1,092  -14% 14/15*
+add              50 ->    50   +0%  0/15      190 ->   180   -5% 11/15*     441 ->   421   -5% 10/15 
+cancel           40 ->    40   +0%  1/15      551 ->   471  -15% 15/15*   1,262 ->   872  -31% 14/15*
+modify           80 ->    90  +12%  0/15*     731 ->   651  -11% 15/15*   1,653 -> 1,302  -21% 14/15*
+marketable      170 ->   170   +0%  8/15    1,162 -> 1,112   -4% 12/15*   2,264 -> 2,164   -4% 12/15*
+```
+
+Every p99 and most p99.9 cells improved, with cancel's p99.9 down a third. The
+one cost is modify's p50, a clock step slower. On the default book no array
+reaches 2 MiB, so nothing changes, and nothing measured did:
+
+```
+                                    p50                         p99                       p99.9
+all              50 ->    50   +0%  0/15      210 ->   210   +0% 10/15      551 ->   541   -2%  8/15 
+add              50 ->    50   +0%  0/15      130 ->   130   +0%  5/15      371 ->   381   +3%  5/15 
+cancel           40 ->    50  +25%  2/15      150 ->   140   -7%  9/15      491 ->   491   +0%  8/15 
+modify           90 ->    90   +0%  0/15      260 ->   260   +0%  8/15      771 ->   752   -2%  8/15 
+marketable      100 ->   100   +0%  3/15      481 ->   471   -2%  9/15    1,222 -> 1,162   -5%  8/15 
+```
+
 ### Before and after: the allocation tail
 
 The same binary, the same flow and the same seed, with container nodes on malloc
@@ -935,8 +986,9 @@ dependent hops per lookup. The layout passes after it -- a 32-byte order slot,
 was. On the deep book a cancel still makes three dependent accesses: its index
 entry, its order slot and its price level, each likely a miss once the book
 outgrows the caches. Smaller structures do not make those accesses fewer.
-Changes that would are the next lever, and this benchmark is how to tell
-whether they work.
+Huge pages made each one cheaper instead, by taking the TLB miss out of it:
+p99 571 → 511 ns and p99.9 1,272 → 1,092 ns. Making them fewer is the next
+lever, and this benchmark is how to tell whether it works.
 
 ## Build
 

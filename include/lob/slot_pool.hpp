@@ -30,6 +30,8 @@
 #include <type_traits>
 #include <vector>
 
+#include "lob/huge_pages.hpp"
+
 #if defined(__SANITIZE_ADDRESS__)
 #define LOB_SLOT_POOL_ASAN 1
 #elif defined(__has_feature)
@@ -122,7 +124,7 @@ public:
     }
 
 private:
-    std::vector<Slot> slots;
+    std::vector<Slot, HugePageAllocator<Slot>> slots;   //Huge pages once past 2 MiB
     std::size_t used = 0;               //High-water mark: slots [0, used) handed out at least once
     std::size_t live = 0;
     SlotIndex free_head = kNoSlot;
