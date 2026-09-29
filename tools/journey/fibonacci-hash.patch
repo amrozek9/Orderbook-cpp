@@ -1,0 +1,43 @@
+--- a/include/lob/id_index.hpp
++++ b/include/lob/id_index.hpp
+@@ -7,27 +7,15 @@
+ // misses on a big book, and one node per order to allocate and free. This is
+ // a single flat array of entries, 16 bytes each for a 4-byte value:
+ //
+-//   - The hash keeps sequential ids sequential: (id ^ id >> log2 capacity),
+-//     masked. Exchanges hand out ids in order, so consecutive adds land in
+-//     consecutive entries -- cache lines already fetched -- and cancels of
+-//     recent orders hit lines still in cache. Folding in the high bits stops
+-//     ids exactly a table apart from all piling onto one slot.
+-//
+-//     A multiplicative hash was tried first and rejected on measurement. It
+-//     scatters sequential ids across the table, so on a 200,000-order book,
+-//     with a 16 MiB table, every add became a DRAM miss: add p50 went from
+-//     70 to 180 ns.
++//   - The hash is one multiply (Fibonacci hashing). Exchanges hand out ids in
++//     sequence; the multiply spreads them across the table, where an identity
++//     hash would pack them into one run and a strided pattern would collide.
+ //   - Collisions probe linearly, so a probe walks forward through memory the
+ //     prefetcher is already pulling in.
+ //   - Capacity is a power of two, kept at most half full: probe runs stay
+ //     short, and the home slot is a shift rather than a division.
+ //   - Erase shifts the following entries back instead of leaving tombstones,
+-//     so a table that sees millions of adds and cancels never degrades. The
+-//     cost is that an erase scans to the end of its run of occupied entries.
+-//     Sequential ids make the newest orders one run, so a cancel scans the
+-//     orders added after it: a handful on the benchmark's flow. Robin Hood
+-//     ordering would let that scan stop at the first entry sitting at its
+-//     home.
++//     so a table that sees millions of adds and cancels never degrades.
+ //
+ // Growth doubles the table and rehashes every entry -- a stall, counted by
+ // growths(). Provision for the peak book and it never happens while matching.
+@@ -120,7 +108,7 @@
+     std::uint64_t grow_count = 0;
+ 
+     std::size_t home(Key id) const {
+-        return static_cast<std::size_t>(id ^ (id >> (64 - shift))) & mask;
++        return static_cast<std::size_t>((id * 0x9E3779B97F4A7C15ull) >> shift);
+     }
+ 
+     void resize_table(std::size_t cap) {

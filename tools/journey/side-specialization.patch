@@ -1,0 +1,178 @@
+--- a/include/lob/order_book.hpp
++++ b/include/lob/order_book.hpp
+@@ -442,16 +442,30 @@
+         SelfTradePolicy policy;
+         Sequence next_seq = 1;          //0 means "no trade" in ExecReport
+ 
++        //Every path an order takes is specialized on its side. The side is
++        //chosen once, at the API boundary; below it, the ladder to rest on,
++        //the ladder to match against and the crossing test are all known at
++        //compile time, so no loop branches on side.
++        template <Side S> auto& own_ladder() {
++            if constexpr (S == Side::Buy) return bids; else return asks;
++        }
++        template <Side S> auto& far_ladder() {
++            if constexpr (S == Side::Buy) return asks; else return bids;
++        }
++
++        template <Side S>
++        ExecReport submit(OrderId id, ParticipantId owner, std::optional<Price> limit,
++                          Quantity qty, bool rest_leftover);
++
+         //`limit` empty means "any price" (market order).
+-        template <typename BookSide>
+-        void match(BookSide& opposite, Order& incoming,
+-                   std::optional<Price> limit, ExecReport& rep);
++        template <Side S>
++        void match(Order& incoming, std::optional<Price> limit, ExecReport& rep);
+ 
+-        template <typename BookSide>
+-        void insert(BookSide& book, const Order& order);
++        template <Side S>
++        void insert(const Order& order);
+ 
+-        template <typename BookSide>
+-        void remove(BookSide& book, SlotIndex slot);
++        template <Side S>
++        void remove(SlotIndex slot);
+ 
+         //Queue maintenance. append takes a filled-in slot; detach unlinks a
+         //slot, subtracts its remaining quantity from the level, and frees it.
+@@ -461,9 +475,6 @@
+         template <typename BookSide>
+         void check_side(const BookSide& book, Side side, std::size_t& counted) const;
+ 
+-        ExecReport submit(OrderId id, ParticipantId owner, Side side,
+-                          std::optional<Price> limit, Quantity qty, bool rest_leftover);
+-
+         //Places both sides' windows around `price`.
+         void place_windows(Price price);
+     };
+--- a/src/order_book.cpp
++++ b/src/order_book.cpp
+@@ -147,13 +147,13 @@
+ 
+ //Walk the opposite book best-price-first, filling `incoming` until it is
+ //exhausted or the next level no longer crosses the limit.
+-template <typename BookSide>
+-void OrderBook::match(BookSide& opposite, Order& incoming,
+-                      std::optional<Price> limit, ExecReport& rep) {
++template <Side S>
++void OrderBook::match(Order& incoming, std::optional<Price> limit, ExecReport& rep) {
++    auto& opposite = far_ladder<S>();
+     const auto crosses = [&](Price level_price) {
+         if (!limit) return true;    //Market order takes any price
+-        return incoming.side == Side::Buy ? level_price <= *limit
+-                                          : level_price >= *limit;
++        if constexpr (S == Side::Buy) return level_price <= *limit;
++        else                          return level_price >= *limit;
+     };
+ 
+     while (incoming.qty > 0) {
+@@ -191,8 +191,7 @@
+             resting.qty -= traded;
+             level.total_qty -= traded;
+ 
+-            const Trade t{next_seq, resting.id, incoming.id,
+-                          level_price, traded, incoming.side};
++            const Trade t{next_seq, resting.id, incoming.id, level_price, traded, S};
+             if (rep.trade_count == 0) rep.first_seq = next_seq;
+             ++next_seq;
+             ++rep.trade_count;
+@@ -230,19 +229,21 @@
+     pool.release(slot);
+ }
+ 
+-template <typename BookSide>
+-void OrderBook::insert(BookSide& book, const Order& order) {
++template <Side S>
++void OrderBook::insert(const Order& order) {
++    auto& book = own_ladder<S>();
+     if (!book.placed()) place_windows(order.price);     //First order to rest
+     PriceLevel& level = book.open(order.price);
+     const SlotIndex slot = pool.acquire();
+     if (slot >= (SlotIndex{1} << 31)) throw std::length_error("OrderBook: over 2^31 resting orders");
+     pool[slot].value = RestingOrder{order.id, order.price, order.qty, order.owner};
+     append(level, slot);
+-    order_index.insert(order.id, index_value(slot, order.side));
++    order_index.insert(order.id, index_value(slot, S));
+ }
+ 
+-template <typename BookSide>
+-void OrderBook::remove(BookSide& book, SlotIndex slot) {
++template <Side S>
++void OrderBook::remove(SlotIndex slot) {
++    auto& book = own_ladder<S>();
+     const Price price = pool[slot].value.price;
+     PriceLevel* level = book.find(price);
+     if (!level) return;
+@@ -251,8 +252,9 @@
+     if (level->empty()) book.closed(price);
+ }
+ 
+-ExecReport OrderBook::submit(OrderId id, ParticipantId owner, Side side,
+-                             std::optional<Price> limit, Quantity qty, bool rest_leftover) {
++template <Side S>
++ExecReport OrderBook::submit(OrderId id, ParticipantId owner, std::optional<Price> limit,
++                             Quantity qty, bool rest_leftover) {
+     ExecReport rep;
+     //A zero-quantity order is a client bug, not a no-op: reject it so the
+     //caller finds out, rather than silently accepting an order that can
+@@ -263,17 +265,14 @@
+         return rep;
+     }
+ 
+-    Order incoming{id, owner, limit.value_or(0), qty, side};
+-
+-    if (side == Side::Buy) match(asks, incoming, limit, rep);
+-    else                   match(bids, incoming, limit, rep);
++    Order incoming{id, owner, limit.value_or(0), qty, S};
++    match<S>(incoming, limit, rep);
+ 
+     rep.remaining = incoming.qty;
+     //A taker halted by STP drops its remainder instead of resting into the
+     //queue it just refused to trade with.
+     if (rest_leftover && incoming.qty > 0 && !rep.stp_halted) {
+-        if (side == Side::Buy) insert(bids, incoming);
+-        else                   insert(asks, incoming);
++        insert<S>(incoming);
+         rep.rested = true;
+     }
+     check_invariants();
+@@ -282,28 +281,30 @@
+ 
+ ExecReport OrderBook::add_limit(OrderId id, ParticipantId owner, Side side,
+                                 Price price, Quantity qty) {
+-    return submit(id, owner, side, price, qty, /*rest_leftover=*/true);
++    return side == Side::Buy ? submit<Side::Buy>(id, owner, price, qty, /*rest_leftover=*/true)
++                             : submit<Side::Sell>(id, owner, price, qty, /*rest_leftover=*/true);
+ }
+ 
+ ExecReport OrderBook::add_limit(OrderId id, Side side, Price price, Quantity qty) {
+-    return submit(id, kAnonymous, side, price, qty, /*rest_leftover=*/true);
++    return add_limit(id, kAnonymous, side, price, qty);
+ }
+ 
+ ExecReport OrderBook::add_market(OrderId id, ParticipantId owner, Side side, Quantity qty) {
+     //No limit, and nothing rests: leftover is dropped when the book runs out.
+-    return submit(id, owner, side, std::nullopt, qty, /*rest_leftover=*/false);
++    return side == Side::Buy ? submit<Side::Buy>(id, owner, std::nullopt, qty, /*rest_leftover=*/false)
++                             : submit<Side::Sell>(id, owner, std::nullopt, qty, /*rest_leftover=*/false);
+ }
+ 
+ ExecReport OrderBook::add_market(OrderId id, Side side, Quantity qty) {
+-    return submit(id, kAnonymous, side, std::nullopt, qty, /*rest_leftover=*/false);
++    return add_market(id, kAnonymous, side, qty);
+ }
+ 
+ bool OrderBook::cancel(OrderId id) {
+     std::uint32_t entry;
+     if (!order_index.take(id, entry)) return false;
+ 
+-    if (side_of(entry) == Side::Buy) remove(bids, slot_of(entry));
+-    else                             remove(asks, slot_of(entry));
++    if (side_of(entry) == Side::Buy) remove<Side::Buy>(slot_of(entry));
++    else                             remove<Side::Sell>(slot_of(entry));
+     check_invariants();
+     return true;
+ }

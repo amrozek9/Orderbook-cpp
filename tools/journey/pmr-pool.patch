@@ -1,0 +1,45 @@
+--- a/include/lob/order_book.hpp
++++ b/include/lob/order_book.hpp
+@@ -4,6 +4,7 @@
+ #include <functional>
+ #include <list>
+ #include <map>
++#include <memory_resource>
+ #include <optional>
+ #include <unordered_map>
+ #include <vector>
+@@ -60,14 +61,18 @@
+     };
+ 
+     struct PriceLevel {
++        using allocator_type = std::pmr::polymorphic_allocator<>;
++        explicit PriceLevel(allocator_type a = {}) : orders(a) {}
++        PriceLevel(const PriceLevel& o, allocator_type a) : total_qty(o.total_qty), orders(o.orders, a) {}
++        PriceLevel(PriceLevel&& o, allocator_type a) : total_qty(o.total_qty), orders(std::move(o.orders), a) {}
+         Volume total_qty = 0;
+-        std::list<Order> orders;    //FIFO: front has time priority
++        std::pmr::list<Order> orders;    //FIFO: front has time priority
+     };
+ 
+     struct Locator {
+         Price price;
+         Side side;
+-        std::list<Order>::iterator order_iter;
++        std::pmr::list<Order>::iterator order_iter;
+     };
+ 
+     //One fill. Always printed at the resting (maker) order's price.
+@@ -187,9 +192,10 @@
+         void check_invariants() const;
+ 
+     private:
+-        std::map<Price, PriceLevel, std::greater<Price>> bids; //Best bid first
+-        std::map<Price, PriceLevel, std::less<Price>> asks;    //Best ask first
+-        std::unordered_map<OrderId, Locator> order_index;      //OrderId -> where it rests
++        std::pmr::unsynchronized_pool_resource pool;
++        std::pmr::map<Price, PriceLevel, std::greater<Price>> bids{&pool}; //Best bid first
++        std::pmr::map<Price, PriceLevel, std::less<Price>> asks{&pool};    //Best ask first
++        std::pmr::unordered_map<OrderId, Locator> order_index{&pool};      //OrderId -> where it rests
+ 
+         TradeRing trade_out;
+         SelfTradePolicy policy;

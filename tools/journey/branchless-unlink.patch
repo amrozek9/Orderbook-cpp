@@ -1,0 +1,38 @@
+--- a/src/order_book.cpp
++++ b/src/order_book.cpp
+@@ -1,6 +1,7 @@
+ #include "lob/order_book.hpp"
+ 
+ #include <algorithm>
++#include <cstdint>
+ #include <cassert>
+ #include <limits>
+ #include <stdexcept>
+@@ -224,10 +225,23 @@
+ 
+ void OrderBook::detach(PriceLevel& level, SlotIndex slot) {
+     const auto& s = pool[slot];
+-    if (s.prev != kNoSlot) pool[s.prev].next = s.next;
+-    else                   level.head = s.next;
+-    if (s.next != kNoSlot) pool[s.next].prev = s.prev;
+-    else                   level.tail = s.prev;
++    //Branch-free unlink. The profile puts these two tests at 80/20 and 62/38,
++    //the least predictable in the hot path. Both candidate words are
++    //addressed unconditionally -- slot 0 stands in when there is no neighbour
++    //-- and a select picks which one to write.
++    //Selected by mask, not by ternary: GCC turns a ternary back into jumps.
++    const auto pick = [](SlotIndex* if_set, SlotIndex* if_clear, bool cond) {
++        const auto a = reinterpret_cast<std::uintptr_t>(if_set);
++        const auto b = reinterpret_cast<std::uintptr_t>(if_clear);
++        return reinterpret_cast<SlotIndex*>(b ^ ((a ^ b) & -static_cast<std::uintptr_t>(cond)));
++    };
++    const bool has_prev = s.prev != kNoSlot;
++    const bool has_next = s.next != kNoSlot;
++    const SlotIndex prev_or_0 = s.prev & -static_cast<SlotIndex>(has_prev);
++    const SlotIndex next_or_0 = s.next & -static_cast<SlotIndex>(has_next);
++    const SlotIndex old_next = s.next, old_prev = s.prev;
++    *pick(&pool[prev_or_0].next, &level.head, has_prev) = old_next;
++    *pick(&pool[next_or_0].prev, &level.tail, has_next) = old_prev;
+     level.total_qty -= s.value.qty;
+     pool.release(slot);
+ }
