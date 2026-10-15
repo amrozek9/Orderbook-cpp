@@ -94,11 +94,9 @@ struct Config {
 struct Stats {
     std::array<std::size_t, kKinds> count{};    //Timed ops of each kind
     std::size_t market_orders = 0;              //Marketable ops sent as market orders
-    std::size_t exhausted = 0;                  //Marketable ops the far side could not fill
     std::size_t trades = 0;                     //Over the timed ops
     std::size_t depth_min = 0;                  //Resting orders over the timed ops
     std::size_t depth_max = 0;
-    std::size_t depth_end = 0;
     lob::Price spread_p50 = 0;                  //Ticks, sampled after every timed op
     lob::Price spread_p99 = 0;
     std::uint64_t flow_hash = 0;                //Identifies the input sequence

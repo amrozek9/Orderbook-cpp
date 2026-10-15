@@ -218,14 +218,8 @@ inline bool diverges(const Sequence& ops, SelfTradePolicy policy) {
 //Greedy delta-debugging: drop operations while the divergence survives.
 //Shrinks a 60-op sequence to the handful that actually matter.
 Sequence shrink(Sequence failing, const lob::Config& cfg);
-inline Sequence shrink(Sequence failing, SelfTradePolicy policy) {
-    return shrink(std::move(failing), engine_config(policy));
-}
 
 //Reproducible C++ for a failing sequence, ready to paste into a test.
 std::string format(const Sequence& ops, const lob::Config& cfg);
-inline std::string format(const Sequence& ops, SelfTradePolicy policy) {
-    return format(ops, engine_config(policy));
-}
 
 }

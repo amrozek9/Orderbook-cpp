@@ -113,8 +113,8 @@ namespace lob {
     //Prices outside the window still work: they fall back to a std::map and pay
     //its pointer chasing. The window never moves once placed, so a market that
     //drifts out of it keeps trading correctly, just slower, and
-    //opened_outside() counts how often that happened. See README, "Price levels
-    //live in a flat array".
+    //opened_outside() counts how often that happened. See README, "Price
+    //levels: a flat array indexed by price".
     template <bool IsBid>
     class PriceLadder {
     public:
@@ -187,7 +187,6 @@ namespace lob {
             if (--occupied > 0 && i == best_idx) best_idx = next_occupied(i);
         }
 
-        std::size_t levels_outside() const {return overflow.size();}
         std::uint64_t opened_outside() const {return outside_opens;}
 
         //Visit every occupied level best-first, as fn(price, level): outside

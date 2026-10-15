@@ -339,6 +339,13 @@ B=build-journey/arena/build/bench
 $B --runs 3 --system-alloc --dump build-journey/malloc.csv
 $B --runs 3 --dump build-journey/arena.csv
 python3 tools/plot_latency.py --out docs/latency \
+    --title "Latency per operation: system malloc vs per-book node arena" \
+    --note "1300,0.0012,the gap is malloc and free" \
+    --note "13000,0.0004,interrupts and hypervisor exits:" \
+    --note "13000,0.00018,the machine, not the engine" \
+    --pnote "99.3,3000,the gap is malloc and free" \
+    --pnote "99.9993,6000,past p99.98 all three meet:" \
+    --pnote "99.9993,3300,the machine, not the engine" \
     "system malloc=build-journey/malloc.csv" "node arena=build-journey/arena.csv"
 ```
 
@@ -514,7 +521,7 @@ Four layers, each catching what the one above it misses.
 
 | Layer | How much | Where it runs |
 |---|---|---|
-| Unit tests (Catch2) | 122 test cases, 201,845 assertions | Debug, Release, ASan + UBSan, TSan |
+| Unit tests (Catch2) | 122 test cases, 201,846 assertions | Debug, Release, ASan + UBSan, TSan |
 | Differential tests in the suite | 13,600 random sequences of 40 to 250 operations, checked against a naive reference book | All four builds |
 | Differential campaigns (`difftest`) | 2,000,000 sequences of 40 operations and 400,000 of 200: 160 million operations, no divergence, on the final commit | Release |
 | Invariant checks | The whole book, after every mutating call | Debug and sanitizer builds |

@@ -30,12 +30,8 @@ COLUMNS = ["p50", "p99", "p99.9"]
 ROW = re.compile(r"\s+(all|add|cancel|modify|marketable)\s+[\d,]+\s+(.*)")
 
 
-def run(command, extra):
-    argv = shlex.split(command) + ["--runs", "1"] + extra
-    out = subprocess.run(argv, capture_output=True, text=True)
-    if out.returncode != 0:
-        sys.exit(f"{command}: exit {out.returncode}\n{out.stderr}")
-    text = out.stdout
+def parse(text):
+    """The flow hash and the p50, p99 and p99.9 of each row of one bench report."""
     flow = re.search(r"hash ([0-9a-f]{16})", text)
     table = {}
     for line in text.split("latency (ns), median")[1].splitlines():
@@ -43,6 +39,14 @@ def run(command, extra):
         if m:
             table[m.group(1)] = [int(v.replace(",", "")) for v in m.group(2).split()[:3]]
     return flow.group(1) if flow else None, table
+
+
+def run(command, extra):
+    argv = shlex.split(command) + ["--runs", "1"] + extra
+    out = subprocess.run(argv, capture_output=True, text=True)
+    if out.returncode != 0:
+        sys.exit(f"{command}: exit {out.returncode}\n{out.stderr}")
+    return parse(out.stdout)
 
 
 def sign_test(wins, losses):

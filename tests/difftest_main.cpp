@@ -14,7 +14,6 @@
 #include <cstdlib>
 #include <iterator>
 #include <optional>
-#include <string>
 
 int main(int argc, char** argv) {
     const std::size_t count = argc > 1 ? std::strtoull(argv[1], nullptr, 10) : 100000;

@@ -21,13 +21,13 @@ two-sided sign test. It needs Python 3, git, CMake, a C++20 compiler, and
 network access once, for Catch2.
 """
 import argparse
-import math
 import os
-import re
 import shlex
 import statistics
 import subprocess
 import sys
+
+from ab_compare import COLUMNS, KINDS, parse, sign_test
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PATCHES = os.path.join(REPO, "tools", "journey")
@@ -49,9 +49,6 @@ PASSES = [
     ("hugepages",  "e2aaec5", None,                        "hints",     "Huge pages"),
 ]
 BOOKS = {"default": [], "deep": ["--depth", "200000", "--ops", "1000000"]}
-KINDS = ["all", "add", "cancel", "modify", "marketable"]
-COLUMNS = ["p50", "p99", "p99.9"]
-ROW = re.compile(r"\s+(all|add|cancel|modify|marketable)\s+[\d,]+\s+(.*)")
 
 
 def sh(argv, log):
@@ -78,15 +75,6 @@ def build(workdir):
         print(f"built {name} from {commit}" + (f" + {patch}" if patch else ""), file=sys.stderr)
 
 
-def parse(text):
-    table = {}
-    for line in text.split("latency (ns), median")[1].splitlines():
-        m = ROW.match(line)
-        if m:
-            table[m.group(1)] = [int(v.replace(",", "")) for v in m.group(2).split()[:3]]
-    return table
-
-
 def run(workdir, book, rounds):
     out = os.path.join(workdir, "raw", book)
     os.makedirs(out, exist_ok=True)
@@ -98,7 +86,7 @@ def run(workdir, book, rounds):
             res = subprocess.run([bench, "--runs", "1"] + BOOKS[book], capture_output=True, text=True)
             if res.returncode != 0:
                 sys.exit(f"{name}: exit {res.returncode}\n{res.stderr}")
-            h = re.search(r"hash ([0-9a-f]{16})", res.stdout).group(1)
+            h, _ = parse(res.stdout)
             if flow is None:
                 flow = h
             elif h != flow:
@@ -106,15 +94,6 @@ def run(workdir, book, rounds):
             with open(os.path.join(out, f"{name}-{r + 1:02d}.txt"), "w") as f:
                 f.write(res.stdout)
         print(f"{book}: round {r + 1}/{rounds}", file=sys.stderr)
-
-
-def sign_test(wins, losses):
-    """Two-sided p for `wins` out of wins + losses fair coin flips; ties dropped."""
-    n = wins + losses
-    if n == 0:
-        return 1.0
-    k = max(wins, losses)
-    return min(1.0, 2 * sum(math.comb(n, i) for i in range(k, n + 1)) / 2 ** n)
 
 
 def report(workdir, book):
@@ -127,7 +106,7 @@ def report(workdir, book):
         for f in os.listdir(raw):
             if f.startswith(name + "-"):
                 with open(os.path.join(raw, f)) as fh:
-                    data[name][f[len(name) + 1:-4]] = parse(fh.read())
+                    data[name][f[len(name) + 1:-4]] = parse(fh.read())[1]
     rounds = sorted(set.intersection(*(set(d) for d in data.values())))
     if not rounds:
         return

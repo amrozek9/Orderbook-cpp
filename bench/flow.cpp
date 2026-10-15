@@ -105,7 +105,6 @@ public:
             sample_spread();
         }
 
-        out.stats.depth_end = book.size();
         out.stats.spread_p50 = spread_percentile(50);
         out.stats.spread_p99 = spread_percentile(99);
         std::uint64_t h = kHashSeed;
@@ -185,7 +184,7 @@ private:
 
     void emit(const Op& op) {
         out.ops.push_back(op);
-        const lob::ExecReport rep = apply(book, op);
+        apply(book, op);
         lob::Trade t;
         std::size_t fills = 0;
         while (book.trades().pop(t)) {trade_hash = hash_trade(trade_hash, t); ++fills;}
@@ -193,10 +192,7 @@ private:
         if (!timing) return;
         ++out.stats.count[static_cast<std::size_t>(op.kind)];
         out.stats.trades += fills;
-        if (op.kind == Kind::Marketable) {
-            out.stats.market_orders += op.market;
-            out.stats.exhausted += op.market && rep.remaining > 0;
-        }
+        if (op.kind == Kind::Marketable) out.stats.market_orders += op.market;
     }
 
     void add(lob::Side side) {

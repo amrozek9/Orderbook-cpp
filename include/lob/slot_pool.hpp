@@ -30,17 +30,10 @@
 #include <type_traits>
 #include <vector>
 
+#include "lob/asan.hpp"
 #include "lob/huge_pages.hpp"
 
-#if defined(__SANITIZE_ADDRESS__)
-#define LOB_SLOT_POOL_ASAN 1
-#elif defined(__has_feature)
-#if __has_feature(address_sanitizer)
-#define LOB_SLOT_POOL_ASAN 1
-#endif
-#endif
-
-#if defined(LOB_SLOT_POOL_ASAN)
+#if defined(LOB_ASAN)
 #include <sanitizer/asan_interface.h>
 #endif
 
@@ -141,7 +134,7 @@ private:
         ++grow_count;
     }
 
-#if defined(LOB_SLOT_POOL_ASAN)
+#if defined(LOB_ASAN)
     void poison(SlotIndex i) const {ASAN_POISON_MEMORY_REGION(&slots[i], sizeof(Slot));}
     void unpoison(SlotIndex i) const {ASAN_UNPOISON_MEMORY_REGION(&slots[i], sizeof(Slot));}
     void unpoison_all() const {

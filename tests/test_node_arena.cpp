@@ -6,6 +6,7 @@
 // operator new. The replacement below is program-wide, so it counts for the
 // whole test binary; it only counts, and hands every request to malloc.
 //-----------------------------------------------------------------------------
+#include "lob/asan.hpp"
 #include "lob/node_arena.hpp"
 #include "lob/order_book.hpp"
 #include "flow.hpp"
@@ -17,7 +18,6 @@
 #include <cstdlib>
 #include <new>
 #include <set>
-#include <vector>
 
 namespace {
     std::atomic<std::size_t> g_system_allocations{0};
@@ -32,18 +32,6 @@ void operator delete(void* p) noexcept {std::free(p);}
 void operator delete(void* p, std::size_t) noexcept {std::free(p);}
 
 namespace {
-
-#if defined(__SANITIZE_ADDRESS__)
-constexpr bool kAsan = true;
-#elif defined(__has_feature)
-#if __has_feature(address_sanitizer)
-constexpr bool kAsan = true;
-#else
-constexpr bool kAsan = false;
-#endif
-#else
-constexpr bool kAsan = false;
-#endif
 
 //Runs a small benchmark flow through `book` and returns how many times the
 //system allocator was called while it did.
@@ -119,7 +107,7 @@ TEST_CASE("arena: provisioning allocates slab space up front") {
 
 TEST_CASE("book: pools its nodes by default, except under AddressSanitizer") {
     lob::OrderBook book;
-    CHECK(book.pools_nodes() == !kAsan);
+    CHECK(book.pools_nodes() == !lob::kAsan);
 }
 
 TEST_CASE("book: pool_nodes = false puts nodes on the system allocator") {
@@ -130,18 +118,18 @@ TEST_CASE("book: pool_nodes = false puts nodes on the system allocator") {
 }
 
 TEST_CASE("book: a provisioned book never calls the system allocator while matching") {
-    if (kAsan) SKIP("the arena is bypassed under AddressSanitizer");
+    if (lob::kAsan) SKIP("the arena is bypassed under AddressSanitizer");
     lob::Config cfg;
     cfg.expected_orders = 2'000;        //The flow peaks well below this
+    SECTION("levels in the flat price array") {}
+    SECTION("every level in the fallback map, on the arena") {cfg.price_levels = 0;}
     lob::OrderBook book(cfg);
     CHECK(allocations_while_matching(book) == 0);
 }
 
 TEST_CASE("book: levels filed in the map on malloc do allocate") {
-    //Keeps the test above honest: the counter sees container allocations. The
-    //pool and the flat id index need none, so this turns off the one thing
-    //that still takes a node per level -- the flat price array -- and puts the
-    //map's nodes on malloc.
+    //Keeps the test above honest: the same map-only book, with its nodes on
+    //malloc instead of the arena, and the counter sees them.
     lob::Config cfg;
     cfg.expected_orders = 2'000;
     cfg.price_levels = 0;

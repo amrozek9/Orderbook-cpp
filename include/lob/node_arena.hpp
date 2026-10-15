@@ -2,15 +2,17 @@
 //-----------------------------------------------------------------------------
 // Per-book node arena.
 //
-// Every resting order costs container nodes -- a list node, a hash-map node,
-// and a map node when it opens a price level -- and every cancel or fill frees
-// them. Through malloc, that traffic is a large share of the p99 and p99.9
-// tail. This is the allocator that replaces it, owned by one book:
+// Orders live in the slot pool and ids in the flat index, so the one container
+// left with nodes is the map that holds price levels outside the flat price
+// array. Its nodes come from here rather than malloc, so even a book trading
+// outside its window does not call the system allocator while matching. (When
+// every order also cost a list node and a hash node, moving them all here cut
+// p99 and p99.9 by a third; the README's optimization journey has the numbers.)
 //
 //   - Blocks are carved from slabs and recycled through one free list per
-//     16-byte size class, LIFO, so the node a cancel frees is the next one an
-//     add reuses, still warm in cache. No headers, no locks, no bin searches:
-//     the containers pass the size back on deallocation.
+//     16-byte size class, LIFO, so the node a level frees is the next one a
+//     new level reuses, still warm in cache. No headers, no locks, no bin
+//     searches: the container passes the size back on deallocation.
 //   - Every slab is touched page by page when it is allocated, and slabs can be
 //     provisioned up front (Config::expected_orders), so the matching path
 //     neither calls the system allocator nor takes a page fault.

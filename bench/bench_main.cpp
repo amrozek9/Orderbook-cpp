@@ -35,11 +35,12 @@
 //               for 200 ms just before the first run, so the core is at full
 //               clock when recording starts.
 //   Memory      The flow and sample buffers are written before timing. The
-//               book is provisioned for twice the target depth, so its node
-//               arena is allocated and touched at construction. On glibc the
-//               heap is also grown by --prefault MiB, every page touched, and
-//               trimming disabled, for whatever still uses malloc. Page faults
-//               and context switches are counted over each timed pass.
+//               book is provisioned for twice the target depth, so its order
+//               pool, id index and arena are allocated and touched at
+//               construction. On glibc the heap is also grown by --prefault
+//               MiB, every page touched, and trimming disabled, for whatever
+//               still uses malloc. Page faults and context switches are
+//               counted over each timed pass.
 //   Clock       rdtscp, not std::chrono. Each sample brackets one engine call
 //               between fenced TSC reads and is stored in ticks; conversion to
 //               nanoseconds happens once, in the report. The median cost of an
@@ -240,9 +241,10 @@ std::vector<std::string> frequency_report(int cpu) {
 }
 
 //Grows the heap by about `mib` MiB, touches every page, and returns it to
-//malloc with trimming disabled, so it stays resident. The engine's node
-//allocations during timing then land on pages that are already mapped instead
-//of faulting them in one at a time. Returns the MiB actually pre-faulted.
+//malloc with trimming disabled, so it stays resident. Anything still allocated
+//during timing -- fallback map nodes under --system-alloc -- then lands on
+//pages that are already mapped instead of faulting them in one at a time.
+//Returns the MiB actually pre-faulted.
 std::size_t prefault_heap(std::size_t mib) {
 #if defined(__GLIBC__)
     constexpr std::size_t kChunk = std::size_t{16} << 20;
@@ -291,8 +293,7 @@ long anon_huge_kib() {
 }
 
 struct Usage {
-    long minor_faults = 0;
-    long major_faults = 0;
+    long faults = 0;            //Minor plus major page faults
     long switches = 0;          //Voluntary plus involuntary context switches
 };
 
@@ -301,16 +302,14 @@ Usage usage_now() {
 #if defined(__linux__)
     rusage r{};
     getrusage(RUSAGE_THREAD, &r);
-    u.minor_faults = r.ru_minflt;
-    u.major_faults = r.ru_majflt;
+    u.faults = r.ru_minflt + r.ru_majflt;
     u.switches = r.ru_nvcsw + r.ru_nivcsw;
 #endif
     return u;
 }
 
 Usage operator-(const Usage& a, const Usage& b) {
-    return {a.minor_faults - b.minor_faults, a.major_faults - b.major_faults,
-            a.switches - b.switches};
+    return {a.faults - b.faults, a.switches - b.switches};
 }
 
 //--- measurement -------------------------------------------------------------
@@ -351,15 +350,14 @@ struct RunResult {
     std::uint64_t dropped = 0;
     std::optional<lob::Price> window_base;      //Where the flat price array landed
     std::uint64_t opened_outside = 0;           //Levels that fell back to the map
-    std::uint64_t pool_growths = 0;             //Times the order pool ran out
-    std::uint64_t index_growths = 0;            //Times the id index rehashed
+    std::uint64_t growths = 0;                  //Times the order pool or id index grew
     long huge_kib = 0;                          //Memory on huge pages while the book lived
 };
 
 class Bench {
 public:
-    Bench(const flow::Flow& fl, const flow::Config& c, const lob::Config& book_config)
-        : f(fl), cfg(c), book_cfg(book_config),
+    Bench(const flow::Flow& fl, const lob::Config& book_config)
+        : f(fl), book_cfg(book_config),
           samples(std::max({f.build, f.warmup, f.timed_count()})),
           spin(f.timed_count()) {
         for (std::size_t k = 0; k < flow::kKinds; ++k) by_kind[k].reserve(f.stats.count[k]);
@@ -396,9 +394,8 @@ public:
         res.dropped = book.trades().dropped();
         res.window_base = book.price_window_base();
         res.opened_outside = book.levels_opened_outside_window();
-        res.pool_growths = book.order_pool_growths();
+        res.growths = book.order_pool_growths() + book.id_index_growths();
         res.huge_kib = anon_huge_kib();
-        res.index_growths = book.id_index_growths();
 
         if (dump) {
             for (std::size_t i = 0; i < n; ++i)
@@ -423,7 +420,6 @@ public:
 
 private:
     const flow::Flow& f;
-    flow::Config cfg;
     lob::Config book_cfg;
     std::uint64_t overhead = 0;
     std::vector<std::uint64_t> samples;     //Ticks, one per op of the current pass
@@ -636,7 +632,7 @@ int main(int argc, char** argv) {
     const flow::Stats& st = f.stats;
 
     //Provisioned for twice the target depth, which the flow never reaches, so
-    //the arena and the id index are sized once, at construction.
+    //the order pool, id index and arena are sized once, at construction.
     lob::Config book_cfg{cfg.self_trade, flow::kTradeCapacity};
     book_cfg.pool_nodes = !system_alloc;
     book_cfg.expected_orders = 2 * cfg.target_depth;
@@ -644,7 +640,7 @@ int main(int argc, char** argv) {
     //report counts any level that does.
     book_cfg.price_levels = price_levels;
     const bool pooled = lob::OrderBook(book_cfg).pools_nodes();
-    Bench bench(f, cfg, book_cfg);
+    Bench bench(f, book_cfg);
     const std::size_t prefaulted = prefault_heap(prefault_mib);
 
     std::FILE* dump = nullptr;
@@ -710,7 +706,7 @@ int main(int argc, char** argv) {
                     ns(all[0], ticks_per_ns).c_str(), ns(all[1], ticks_per_ns).c_str(),
                     ns(all[2], ticks_per_ns).c_str(), ns(all[3], ticks_per_ns).c_str(),
                     ns(all[4], ticks_per_ns).c_str(),
-                    res.usage.minor_faults + res.usage.major_faults, res.usage.switches,
+                    res.usage.faults, res.usage.switches,
                     res.stayed_on_cpu ? "" : "  WARNING: left its cpu");
         std::fflush(stdout);
         results.push_back(res);
@@ -718,12 +714,12 @@ int main(int argc, char** argv) {
     std::printf("  trade stream %016llx in every run, matching the generator\n",
                 (unsigned long long)st.trade_hash);
     std::uint64_t outside = 0, growths = 0;
+    long huge = 0;
     for (const RunResult& r : results) {
         outside = std::max(outside, r.opened_outside);
-        growths = std::max(growths, r.pool_growths + r.index_growths);
+        growths = std::max(growths, r.growths);
+        huge = std::max(huge, r.huge_kib);
     }
-    long huge = 0;
-    for (const RunResult& r : results) huge = std::max(huge, r.huge_kib);
     std::printf("  huge pages   %ld MiB of the book on 2 MiB pages (transparent huge pages: %s)\n",
                 huge / 1024, thp_mode().c_str());
     std::printf("  orders       pool and id index never outgrew %s orders%s\n",

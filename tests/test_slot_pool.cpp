@@ -5,6 +5,7 @@
 //-----------------------------------------------------------------------------
 #include <catch2/catch_test_macros.hpp>
 
+#include "lob/asan.hpp"
 #include "lob/order_book.hpp"
 #include "lob/slot_pool.hpp"
 
@@ -75,11 +76,9 @@ TEST_CASE("pool: slots stay distinct through churn and growth") {
 }
 
 TEST_CASE("pool: consistent() catches a free list that loops") {
-#if defined(LOB_SLOT_POOL_ASAN)
     //Corrupting the list means writing into a released slot, which is exactly
     //what the pool's poisoning makes AddressSanitizer report.
-    SKIP("writes into a released slot, which ASan rightly forbids");
-#endif
+    if (lob::kAsan) SKIP("writes into a released slot, which ASan rightly forbids");
     SlotPool<int> pool(4);
     const SlotIndex a = pool.acquire();
     const SlotIndex b = pool.acquire();

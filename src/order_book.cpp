@@ -1,4 +1,5 @@
 #include "lob/order_book.hpp"
+#include "lob/asan.hpp"
 
 #include <algorithm>
 #include <cassert>
@@ -14,34 +15,21 @@ namespace {
         return p;
     }
 
-#if defined(__SANITIZE_ADDRESS__)
-    constexpr bool kArenaAllowed = false;
-#elif defined(__has_feature)
-#if __has_feature(address_sanitizer)
-    constexpr bool kArenaAllowed = false;
-#else
-    constexpr bool kArenaAllowed = true;
-#endif
-#else
-    constexpr bool kArenaAllowed = true;
-#endif
-
     //Arena bytes one resting order can need: a map node in case it opens a
-    //level outside the price window. The order lives in the slot pool and its
-    //id in the flat index, so this is the only per-order node left. Node
-    //layouts are the standard library's business, so this assumes a payload
-    //plus its links and rounds up to the arena's granule; provisioning only
-    //has to be generous.
-    constexpr std::size_t node_bytes(std::size_t payload, std::size_t links) {
-        const std::size_t raw = payload + links * sizeof(void*);
-        return (raw + NodeArena::kGranule - 1) / NodeArena::kGranule * NodeArena::kGranule;
-    }
-    constexpr std::size_t kBytesPerOrder = node_bytes(sizeof(std::pair<const Price, PriceLevel>), 4);
+    //level outside the price window. Node layouts are the standard library's
+    //business, so this assumes the payload plus four pointers of links and
+    //color, rounded up to the arena's granule; provisioning only has to be
+    //generous.
+    constexpr std::size_t kBytesPerOrder =
+        (sizeof(std::pair<const Price, PriceLevel>) + 4 * sizeof(void*) + NodeArena::kGranule - 1)
+        / NodeArena::kGranule * NodeArena::kGranule;
 
     constexpr std::size_t kDefaultPoolSlots = 1024;
 
+    //Under AddressSanitizer the arena is bypassed, so freed map nodes go
+    //through ASan's allocator and stay poisoned and quarantined.
     std::unique_ptr<NodeArena> make_arena(const Config& cfg) {
-        if (!kArenaAllowed || !cfg.pool_nodes) return nullptr;
+        if (kAsan || !cfg.pool_nodes) return nullptr;
         return std::make_unique<NodeArena>(cfg.expected_orders * kBytesPerOrder);
     }
 
@@ -248,7 +236,7 @@ template <typename BookSide>
 void OrderBook::remove(BookSide& book, SlotIndex slot) {
     const Price price = pool[slot].value.price;
     PriceLevel* level = book.find(price);
-    if (!level) [[unlikely]] return;
+    assert(level && "a resting order's level is missing");
 
     detach(*level, slot);
     if (level->empty()) [[unlikely]] book.closed(price);          //0.5% profiled

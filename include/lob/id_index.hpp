@@ -32,6 +32,7 @@
 // Growth doubles the table and rehashes every entry -- a stall, counted by
 // growths(). Provision for the peak book and it never happens while matching.
 //-----------------------------------------------------------------------------
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
@@ -117,19 +118,18 @@ private:
 
     std::vector<Entry, HugePageAllocator<Entry>> table; //Huge pages once past 2 MiB
     std::size_t mask = 0;
-    unsigned shift = 0;             //64 - log2(capacity)
+    unsigned bits = 0;              //log2(capacity)
     std::size_t count = 0;
     std::uint64_t grow_count = 0;
 
     std::size_t home(Key id) const {
-        return static_cast<std::size_t>(id ^ (id >> (64 - shift))) & mask;
+        return static_cast<std::size_t>(id ^ (id >> bits)) & mask;
     }
 
     void resize_table(std::size_t cap) {
         table.assign(cap, Entry{});
         mask = cap - 1;
-        shift = 64;
-        for (std::size_t c = cap; c > 1; c >>= 1) --shift;
+        bits = static_cast<unsigned>(std::countr_zero(cap));
     }
 
     void place(Key id, const Value& value) {
