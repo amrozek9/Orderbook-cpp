@@ -1,5 +1,7 @@
 # lob — a limit order book
 
+[![CI](https://github.com/amrozek9/Orderbook-cpp/actions/workflows/ci.yml/badge.svg)](https://github.com/amrozek9/Orderbook-cpp/actions/workflows/ci.yml)
+
 A price-time priority limit order book in C++20 whose matching path never
 allocates, never does I/O and never walks a tree: price levels sit in a flat
 array, orders in a pool of 32-byte slots linked by 32-bit index, and order ids
@@ -526,9 +528,13 @@ Four layers, each catching what the one above it misses.
 | Differential campaigns (`difftest`) | 2,000,000 sequences of 40 operations and 400,000 of 200: 160 million operations, no divergence, on the final commit | Release |
 | Invariant checks | The whole book, after every mutating call | Debug and sanitizer builds |
 
-Before every optimization commit: the Debug and Release suites, `difftest` at
-1,000,000 sequences of 40 operations and 200,000 of 200 in Release, the ASan +
-UBSan suite with 20,000 more sequences, and the TSan suite.
+[CI](.github/workflows/ci.yml) runs all four builds on every push to `main` and every pull
+request, with GCC 14: the suite in each; `difftest` at 200,000 sequences of 40
+operations and 20,000 of 200 in Release and 20,000 in Debug and under ASan; and
+a smoke run of the benchmark, which fails if any run's trade stream differs
+from the generator's. Before every optimization commit, the same builds ran
+locally with longer campaigns: 1,000,000 sequences of 40 operations and 200,000
+of 200.
 
 ### Unit tests
 

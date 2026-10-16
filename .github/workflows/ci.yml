@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same branch makes an older run's result moot.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CC: gcc-14
+      CXX: g++-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Invariant checks after every operation.
+          - name: Debug
+            build_type: Debug
+            difftest: 20000 1 40
+          - name: Release
+            build_type: Release
+            difftest: 200000 1 40
+            difftest_long: 20000 5000000 200
+            bench: true
+          - name: ASan + UBSan
+            build_type: Debug
+            sanitizer: address
+            difftest: 20000 1 40
+          # The differential campaign is single-threaded, so TSan runs the
+          # suite alone, which is where the threading tests live.
+          - name: TSan
+            build_type: Debug
+            sanitizer: thread
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The runner's kernel randomizes mmap with more bits than ThreadSanitizer's
+      # memory layout allows, and TSan aborts at startup unless this is lowered.
+      - name: Make room for ThreadSanitizer
+        if: matrix.sanitizer == 'thread'
+        run: sudo sysctl vm.mmap_rnd_bits=28
+
+      - name: Configure
+        run: >-
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DLOB_SANITIZER=${{ matrix.sanitizer }}
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Unit and differential tests
+        run: ./build/tests
+
+      - name: Differential campaign
+        if: matrix.difftest
+        run: ./build/difftest ${{ matrix.difftest }}
+
+      - name: Differential campaign, long sequences
+        if: matrix.difftest_long
+        run: ./build/difftest ${{ matrix.difftest_long }}
+
+      # Timings on a shared runner mean nothing. This checks that the benchmark
+      # runs, on the flat price array and on the fallback map, and that every
+      # run's trade stream matches the generator's: bench exits non-zero if not.
+      - name: Benchmark smoke run
+        if: matrix.bench
+        run: |
+          ./build/bench --runs 1 --ops 200000 --warmup 20000
+          ./build/bench --runs 1 --ops 200000 --warmup 20000 --price-levels 0 --system-alloc
+
+      - name: Analysis tools
+        if: matrix.bench
+        run: |
+          python3 tools/ab_compare.py --pairs 1 build/bench build/bench -- --ops 50000 --warmup 5000
+          ./build/bench --runs 1 --ops 50000 --warmup 5000 --dump build/samples.csv > /dev/null
+          python3 tools/plot_latency.py --out build/latency "samples=build/samples.csv"
+          python3 -m py_compile tools/journey.py
