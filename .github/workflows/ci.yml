@@ -46,7 +46,7 @@ jobs:
             sanitizer: thread
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # The runner's kernel randomizes mmap with more bits than ThreadSanitizer's
       # memory layout allows, and TSan aborts at startup unless this is lowered.
